@@ -739,6 +739,12 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
     private volatile Thread cycleThread;
 
     /**
+     * Longest wait of {@link #internalDestroy()} for the cycle it interrupted
+     * @since 1.2.10
+     */
+    private static final long DESTROY_WAIT_SECONDS = 5;
+
+    /**
      * Format date for utility purposes
      * @since 1.0.1
      */
@@ -1455,6 +1461,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             if (running != null) {
                 running.interrupt();
             }
+            awaitCycleEnd(running);
 
             aggregatedDevices.clear();
             zoomRoomsMetricsData.clear();
@@ -1479,7 +1486,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         headers.add("Content-Type", "application/json");
         if (uri.contains(ZOOM_ROOM_OAUTH_URL)) {
             String oauthPair = getLogin() + ":" + getPassword(); // ClientId:ClientSecret in OAuth flow
-            logDebugMessage("Attempt to generate OAuth token with credentials: " + oauthPair);
+            logDebugMessage("Requesting an OAuth access token.");
             headers.add("Authorization", "Basic " + Base64.getEncoder().encodeToString(oauthPair.getBytes(StandardCharsets.UTF_8)));
         } else {
             ensureAuthorized();
@@ -1532,25 +1539,49 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      */
     @Override
     public PollResult poll(PollContext context) throws Exception {
+        if (context.getReason() == PollContext.Reason.WEBHOOK) {
+            // no Zoom requests: never shared with a running collection, nor held up by it
+            return result(true, Collections.emptyList());
+        }
         return singleFlight(() -> {
-            boolean complete = true;
-            List<Statistics> aggregatorStatistics = Collections.emptyList();
-            if (context.getReason() != PollContext.Reason.WEBHOOK) {
-                complete = collect(context);
-                aggregatorStatistics = getMultipleStatistics();
-            }
-            long now = System.currentTimeMillis();
-            refreshRoomsInCall(now);
-            List<AggregatedDevice> devices = snapshot();
-            throwCollectionErrors();
-            return PollResult.builder()
-                    .aggregatorStatistics(aggregatorStatistics)
-                    .devices(devices)
-                    .complete(complete)
-                    .errors(knownErrors)
-                    .nextNotBefore(metricsBlockedUntil > now ? Instant.ofEpochMilli(metricsBlockedUntil) : null)
-                    .build();
+            boolean complete = collect(context);
+            return result(complete, getMultipleStatistics());
         });
+    }
+
+    /** The rooms as they are now, with inCall refreshed; throws a recorded login failure or unreachable API. */
+    private PollResult result(boolean complete, List<Statistics> aggregatorStatistics) throws Exception {
+        long now = System.currentTimeMillis();
+        refreshRoomsInCall(now);
+        List<AggregatedDevice> devices = snapshot();
+        throwCollectionErrors();
+        return PollResult.builder()
+                .aggregatorStatistics(aggregatorStatistics)
+                .devices(devices)
+                .complete(complete)
+                .errors(knownErrors)
+                .nextNotBefore(metricsBlockedUntil > now ? Instant.ofEpochMilli(metricsBlockedUntil) : null)
+                .build();
+    }
+
+    /**
+     * Waits, at most {@link #DESTROY_WAIT_SECONDS}, for the cycle that {@link #internalDestroy()} interrupted, so the
+     * caches are not cleared under it. Nothing to wait for when the destroying thread runs the cycle itself.
+     */
+    private void awaitCycleEnd(Thread running) {
+        CompletableFuture<PollResult> inFlight = cycleInFlight.get();
+        if (inFlight == null || running == Thread.currentThread()) {
+            return;
+        }
+        try {
+            inFlight.get(DESTROY_WAIT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (TimeoutException e) {
+            logger.warn("The interrupted Zoom Rooms cycle did not end within " + DESTROY_WAIT_SECONDS + " s, destroying anyway.");
+        } catch (ExecutionException | java.util.concurrent.CancellationException e) {
+            logDebugMessage("The interrupted Zoom Rooms cycle ended with " + e.getCause());
+        }
     }
 
     /**
@@ -1620,6 +1651,9 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         if (aggregatedDevices.isEmpty()) {
             return true;
         }
+        if (context.isExpired()) {
+            return false;
+        }
         try {
             // The following request collect all the information, so in order to save number of requests, which is
             // daily limited for certain APIs, we need to request them once per monitoring cycle.
@@ -1635,14 +1669,15 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             }
             logger.error("Error occurred during ZoomRooms metrics retrieval.", e);
         }
-        boolean complete = collectRoomDetails(context);
+        boolean complete = !context.isExpired() && collectRoomDetails(context);
         lastMonitoringCycleDuration = Math.max((System.currentTimeMillis() - startCycle) / 1000, 1L);
         return complete;
     }
 
     /**
-     * Collects every room's details in parallel on the context's executor. Rooms not done by the deadline are cancelled
-     * and keep their last values.
+     * Collects every room's details in parallel on the context's executor. Rooms not started by the deadline are not
+     * submitted, and rooms not done by then are cancelled; they keep their last values. The executor may block on
+     * submit (a host bounding the threads per connection), so the deadline is checked before every room.
      *
      * @return {@code false} if the deadline passed or the executor refused a room
      */
@@ -1655,6 +1690,12 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                     // room devices are collected with their room
                     knownErrors.remove(deviceId);
                     continue;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("Zoom Rooms cycle interrupted");
+                }
+                if (context.isExpired()) {
+                    throw new TimeoutException("deadline passed before every room was started");
                 }
                 String deviceName = entry.getValue().getDeviceName();
                 FutureTask<Void> room = new FutureTask<>(() -> {

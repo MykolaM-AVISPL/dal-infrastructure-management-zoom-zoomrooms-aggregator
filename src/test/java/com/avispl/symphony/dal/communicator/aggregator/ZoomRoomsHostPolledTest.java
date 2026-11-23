@@ -13,9 +13,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -54,8 +57,7 @@ public class ZoomRoomsHostPolledTest {
 
     private final String roomId = "r" + UUID.randomUUID();
     private final String roomUserId = "u" + UUID.randomUUID();
-    private final String slowRoomId = "r" + UUID.randomUUID();
-    private final String slowRoomUserId = "u" + UUID.randomUUID();
+    private final String slowUserPrefix = "slow-" + UUID.randomUUID() + "-";
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
     private FakeZoom zoom;
 
@@ -172,7 +174,7 @@ public class ZoomRoomsHostPolledTest {
     @Test
     public void poll_shouldReturnIncomplete_whenDeadlinePasses() throws Exception {
         zoom.setExcludePropertyGroups("RoomDevices,RoomControlSettings");
-        zoom.withSlowRoom = true;
+        zoom.slowRooms = 1;
 
         long started = System.currentTimeMillis();
         PollResult result = zoom.poll(new PollContext(executor, Instant.now().plusMillis(700), PollContext.Reason.SCHEDULE));
@@ -180,6 +182,79 @@ public class ZoomRoomsHostPolledTest {
         Assertions.assertFalse(result.isComplete());
         Assertions.assertTrue(System.currentTimeMillis() - started < 3000, "the cycle ends near its deadline, not after the slow room");
         Assertions.assertEquals(2, result.getDevices().size());
+    }
+
+    @Test
+    public void poll_shouldStopSubmittingRooms_whenDeadlinePassesOnABoundedExecutor() throws Exception {
+        zoom.setExcludePropertyGroups("RoomDevices,RoomControlSettings");
+        zoom.slowRooms = 6;
+        Semaphore permits = new Semaphore(1);
+        Executor bounded = task -> {
+            permits.acquireUninterruptibly();
+            executor.execute(() -> {
+                try {
+                    task.run();
+                } finally {
+                    permits.release();
+                }
+            });
+        };
+
+        long started = System.currentTimeMillis();
+        PollResult result = zoom.poll(new PollContext(bounded, Instant.now().plusMillis(500), PollContext.Reason.SCHEDULE));
+
+        Assertions.assertFalse(result.isComplete());
+        Assertions.assertTrue(System.currentTimeMillis() - started < 3000, "rooms not started by the deadline are skipped, not queued behind the slow ones");
+    }
+
+    @Test
+    public void poll_shouldNotWaitForAVendorCycle_whenAskedForAWebhookSnapshot() throws Exception {
+        zoom.holdRooms = new CountDownLatch(1);
+        Thread scheduled = new Thread(() -> {
+            try {
+                zoom.poll(context(PollContext.Reason.SCHEDULE, 30));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        scheduled.start();
+        Assertions.assertTrue(zoom.roomsRequested.await(5, TimeUnit.SECONDS));
+        AtomicReference<PollResult> snapshot = new AtomicReference<>();
+        Thread webhook = new Thread(() -> {
+            try {
+                snapshot.set(zoom.poll(context(PollContext.Reason.WEBHOOK, 30)));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+
+        webhook.start();
+        webhook.join(2000);
+
+        Assertions.assertNotNull(snapshot.get(), "the webhook snapshot does not wait for the vendor cycle");
+        Assertions.assertTrue(snapshot.get().getAggregatorStatistics().isEmpty());
+        zoom.holdRooms.countDown();
+        scheduled.join(5000);
+        Assertions.assertEquals(1, zoom.roomsRequests.get());
+    }
+
+    @Test
+    public void destroy_shouldWaitForTheRunningCycle() throws Exception {
+        zoom.holdRooms = new CountDownLatch(1);
+        Thread caller = new Thread(() -> {
+            try {
+                zoom.poll(context(PollContext.Reason.SCHEDULE, 30));
+            } catch (Exception e) {
+                // interrupted by destroy
+            }
+        });
+        caller.start();
+        Assertions.assertTrue(zoom.roomsRequested.await(5, TimeUnit.SECONDS));
+        CompletableFuture<?> cycle = ((AtomicReference<CompletableFuture<?>>) field("cycleInFlight")).get();
+
+        zoom.destroy();
+
+        Assertions.assertTrue(cycle.isDone(), "destroy returns only after the cycle stopped writing");
     }
 
     @Test
@@ -231,10 +306,11 @@ public class ZoomRoomsHostPolledTest {
                 .orElseThrow(() -> new AssertionError("no EndpointStatistics"));
     }
 
-    private Object field(String name) throws Exception {
+    @SuppressWarnings("unchecked")
+    private <T> T field(String name) throws Exception {
         Field f = ZoomRoomsAggregatorCommunicator.class.getDeclaredField(name);
         f.setAccessible(true);
-        return f.get(zoom);
+        return (T) f.get(zoom);
     }
 
     /** Answers rooms, metrics and user details without a network; counts requests and can hold them. */
@@ -246,7 +322,7 @@ public class ZoomRoomsHostPolledTest {
         final CountDownLatch metricsRequested = new CountDownLatch(1);
         volatile CountDownLatch holdRooms;
         volatile CountDownLatch holdMetrics;
-        volatile boolean withSlowRoom;
+        volatile int slowRooms;
 
         FakeZoom() throws IOException {
             setLogin("clientId");
@@ -271,7 +347,11 @@ public class ZoomRoomsHostPolledTest {
                 roomsRequests.incrementAndGet();
                 roomsRequested.countDown();
                 await(holdRooms);
-                String slow = withSlowRoom ? ",{\"id\":\"" + slowRoomUserId + "\",\"room_id\":\"" + slowRoomId + "\",\"name\":\"Slow\",\"status\":\"Available\"}" : "";
+                StringBuilder slow = new StringBuilder();
+                for (int i = 0; i < slowRooms; i++) {
+                    slow.append(",{\"id\":\"").append(slowUserPrefix).append(i).append("\",\"room_id\":\"r").append(slowUserPrefix).append(i)
+                            .append("\",\"name\":\"Slow\",\"status\":\"Available\"}");
+                }
                 return responseClass.cast(JSON.readTree("{\"rooms\":[{\"id\":\"" + roomUserId + "\",\"room_id\":\"" + roomId
                         + "\",\"name\":\"Board Room\",\"status\":\"Available\"}" + slow + "],\"next_page_token\":\"\"}"));
             }
@@ -282,8 +362,8 @@ public class ZoomRoomsHostPolledTest {
                         + "\",\"device_ip\":\"10.0.0.1\",\"status\":\"Available\"}],\"next_page_token\":\"\"}"));
             }
             if (url.startsWith("users/")) {
-                if (url.endsWith(slowRoomUserId)) {
-                    TimeUnit.SECONDS.sleep(5);
+                if (url.contains(slowUserPrefix)) {
+                    TimeUnit.SECONDS.sleep(slowRooms > 1 ? 1 : 5);
                 }
                 return responseClass.cast(JSON.readTree("{\"role_name\":\"Member\"}"));
             }
