@@ -22,11 +22,17 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -60,6 +66,9 @@ import com.avispl.symphony.api.dal.dto.monitor.aggregator.AggregatedDevice;
 import com.avispl.symphony.api.dal.error.CommandFailureException;
 import com.avispl.symphony.api.dal.monitor.Monitorable;
 import com.avispl.symphony.api.dal.monitor.aggregator.Aggregator;
+import com.avispl.symphony.api.dal.monitor.aggregator.HostPolled;
+import com.avispl.symphony.api.dal.monitor.aggregator.PollContext;
+import com.avispl.symphony.api.dal.monitor.aggregator.PollResult;
 import com.avispl.symphony.api.dal.webhook.WebhookEnabled;
 import com.avispl.symphony.api.dal.webhook.WebhookEvent;
 import com.avispl.symphony.api.dal.webhook.WebhookReceiver;
@@ -86,7 +95,8 @@ import com.avispl.symphony.dal.util.StringUtils;
  * @author Maksym.Rossiytsev
  * @since 1.0.0
  */
-public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements Aggregator, Monitorable, Controller, WebhookEnabled, WebhookReceiver {
+public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
+        implements Aggregator, Monitorable, Controller, WebhookEnabled, WebhookReceiver, HostPolled {
 
     /**
      * Paginated response interface, needed to delegate paginated meetings to a caller
@@ -125,127 +135,43 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
         @Override
         public void run() {
             logDebugMessage("Entering device data loader active stage.");
-            mainloop:
             while (inProgress) {
                 try {
-                    try {
-                        TimeUnit.MILLISECONDS.sleep(500);
-                    } catch (InterruptedException e) {
-                        logger.error("Startup idle period is interrupted.", e);
-                    }
-
+                    TimeUnit.MILLISECONDS.sleep(500);
                     if (!inProgress) {
-                        logDebugMessage("Main data collection thread is not in progress, breaking.");
-                        break mainloop;
+                        break;
                     }
-
                     updateAggregatorStatus();
                     // next line will determine whether Zoom monitoring was paused
                     if (devicePaused) {
                         logDebugMessage("The device communicator is paused, data collector is not active.");
-                        continue mainloop;
+                        continue;
                     }
-                    long startCycle = System.currentTimeMillis();
-                    try {
-                        logDebugMessage("Fetching devices list.");
-                        // Errors are not cleared per cycle: each one stays until the operation that raised it succeeds,
-                        // since most operations run in cooldown and a per-cycle clear would hide an unresolved error
-                        fetchDevicesList();
-                    } catch (Exception e) {
-                        ResourceNotReachableException unreachable = findUnreachable(e);
-                        if (unreachable != null) {
-                            // Thrown to the callers of get/retrieveMultipleStatistics until the rooms list is retrieved again
-                            unreachableErrors.put(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY, unreachable);
-                        } else {
-                            knownErrors.put(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
-                        }
-                        logger.error("Error occurred during device list retrieval.", e);
+                    while (inProgress && nextDevicesCollectionIterationTimestamp > System.currentTimeMillis()) {
+                        TimeUnit.MILLISECONDS.sleep(1000);
                     }
-
-                    if (!inProgress) {
-                        logDebugMessage("The data collection thread is not in progress. Breaking the loop.");
-                        break mainloop;
+                    ExecutorService pool = executorService;
+                    if (!inProgress || pool == null) {
+                        break;
                     }
-
-                    int aggregatedDevicesCount = aggregatedDevices.size();
-                    if (aggregatedDevicesCount == 0) {
+                    // CommProxy mode has no deadline: the cycle collects every room, however long it takes
+                    PollContext context = new PollContext(pool, Instant.now().plus(Duration.ofDays(1)), PollContext.Reason.SCHEDULE);
+                    singleFlight(() -> PollResult.builder().complete(collect(context)).build());
+                    if (aggregatedDevices.isEmpty()) {
                         logDebugMessage("No devices collected in the main data collection thread so far. Continuing.");
-                        continue mainloop;
+                        continue;
                     }
-
-                    while (nextDevicesCollectionIterationTimestamp > System.currentTimeMillis()) {
-                        try {
-                            TimeUnit.MILLISECONDS.sleep(1000);
-                        } catch (InterruptedException e) {
-                            logger.error("Idle period before new monitoring cycle is interrupted.", e);
-                        }
-                    }
-
-                    try {
-                        // The following request collect all the information, so in order to save number of requests, which is
-                        // daily limited for certain APIs, we need to request them once per monitoring cycle.
-
-                        retrieveZoomRoomMetrics();
-                    } catch (Exception e) {
-                        ResourceNotReachableException unreachable = findUnreachable(e);
-                        if (unreachable != null) {
-                            // Thrown to the callers of get/retrieveMultipleStatistics until the metrics are retrieved again
-                            unreachableErrors.put(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY, unreachable);
-                        } else {
-                            knownErrors.put(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
-                        }
-                        logger.error("Error occurred during ZoomRooms metrics retrieval.", e);
-                    }
-
-                    for (AggregatedDevice aggregatedDevice : aggregatedDevices.values()) {
-                        if (!inProgress) {
-                            logDebugMessage("The data collection thread is not in progress. Breaking the data update loop.");
-                            break;
-                        }
-                        if (executorService == null) {
-                            logDebugMessage("Executor service reference is null. Breaking the execution.");
-                            break;
-                        }
-                        devicesExecutionPool.add(executorService.submit(() -> {
-                            String deviceId = aggregatedDevice.getDeviceId();
-                            try {
-                                String internalId = aggregatedDevices.entrySet().stream().filter(deviceEntry -> deviceEntry.getKey().endsWith(deviceId)).findFirst().map(Map.Entry::getKey).get();
-                                // We need to only work with rooms here
-                                if (!internalId.startsWith(ROOM_DEVICE_ID_PREFIX)) {
-                                    populateDeviceDetails(deviceId);
-                                }
-                                knownErrors.remove(deviceId);
-                            } catch (Exception e) {
-                                knownErrors.put(deviceId, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
-                                logger.error(String.format("Exception during Zoom Room '%s' data processing.", aggregatedDevice.getDeviceName()), e);
-                            }
-                        }));
-                    }
-                    do {
-                        try {
-                            TimeUnit.MILLISECONDS.sleep(500);
-                        } catch (InterruptedException e) {
-                            logger.error("Interrupted exception during main loop execution", e);
-                            if (!inProgress) {
-                                logDebugMessage("Breaking after the main loop execution");
-                                break;
-                            }
-                        }
-                        devicesExecutionPool.removeIf(Future::isDone);
-                    } while (!devicesExecutionPool.isEmpty());
-
                     // We don't want to fetch devices statuses too often, so by default it's currentTime + 60s
                     // otherwise - the variable is reset by the retrieveMultipleStatistics() call, which
                     // launches devices detailed statistics collection
-                    try {
-                        nextDevicesCollectionIterationTimestamp = System.currentTimeMillis() + (getMonitoringRate() * 60000L);
-                    } catch (NoSuchMethodError nsme) {
-                        nextDevicesCollectionIterationTimestamp = System.currentTimeMillis() + 60000L;
-                        logger.warn("Unsupported feature: getMonitoringRate isn't available on current Cloud Connector version.", nsme);
-                    }
-                    lastMonitoringCycleDuration = Math.max((System.currentTimeMillis() - startCycle) / 1000, 1L);
+                    nextDevicesCollectionIterationTimestamp = System.currentTimeMillis() + monitoringRateMillis();
                     logDebugMessage("Finished collecting devices statistics cycle at " + new Date() + ", total duration: " + lastMonitoringCycleDuration);
-                } catch(Throwable e) {
+                } catch (InterruptedException e) {
+                    // destroy() shuts the executor down: stop here instead of sleeping out the monitoring interval
+                    Thread.currentThread().interrupt();
+                    logDebugMessage("Device data loader is interrupted, stopping.");
+                    break;
+                } catch (Throwable e) {
                     logger.error("Unexpected error occurred during main device collection cycle", e);
                 } finally {
                     lastActivityTimestamp = System.currentTimeMillis();
@@ -790,26 +716,33 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
     private volatile boolean devicePaused = true;
 
     /**
-     * Executor that runs all the async operations, that {@link #deviceDataLoader} is posting and
-     * {@link #devicesExecutionPool} is keeping track of
+     * CommProxy mode only: runs {@link #deviceDataLoader} and the room details it collects. Created by the first
+     * {@link #retrieveMultipleStatistics()}, never when a host drives the cycles through {@link #poll(PollContext)}.
      */
     private ExecutorService executorService;
 
     /**
-     * Runner service responsible for collecting data and posting processes to {@link #devicesExecutionPool}
+     * CommProxy mode only: the loop that runs a cycle every monitoring interval
      */
     private ZoomRoomsDeviceDataLoader deviceDataLoader;
+
+    /**
+     * The cycle in progress, shared with every caller that asks for a cycle meanwhile; {@code null} between cycles
+     * @since 1.2.10
+     */
+    private final AtomicReference<CompletableFuture<PollResult>> cycleInFlight = new AtomicReference<>();
+
+    /**
+     * Thread running the cycle in progress, interrupted by {@link #internalDestroy()}
+     * @since 1.2.10
+     */
+    private volatile Thread cycleThread;
 
     /**
      * Format date for utility purposes
      * @since 1.0.1
      */
     SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
-
-    /**
-     * Pool for keeping all the async operations in, to track any operations in progress and cancel them if needed
-     */
-    private List<Future> devicesExecutionPool = new ArrayList<>();
 
     /**
      * Retrieves {@link #idleTimeout}
@@ -1274,9 +1207,6 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
         aggregatedDeviceProcessor = new AggregatedDeviceProcessor(mapping);
         adapterProperties = new Properties();
         adapterProperties.load(getClass().getResourceAsStream("/version.properties"));
-
-        executorService = Executors.newFixedThreadPool(executorServiceThreadCount);
-        executorService.submit(deviceDataLoader = new ZoomRoomsDeviceDataLoader());
     }
 
     /**
@@ -1405,15 +1335,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
     @Override
     public List<Statistics> getMultipleStatistics() throws Exception {
         updateValidRetrieveStatisticsTimestamp();
-        if (authorization == null || authorization.updateRequired()) {
-            logDebugMessage("Unable to find oAuthAccessToken, regenerating.");
-            authorizationLock.lock();
-            try {
-                authenticate();
-            } finally {
-                authorizationLock.unlock();
-            }
-        }
+        ensureAuthorized();
         throwIfUnreachable();
         Map<String, String> statistics = new HashMap<>();
         ExtendedStatistics extendedStatistics = new ExtendedStatistics();
@@ -1529,8 +1451,10 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
             } finally {
                 dataCollectorOperationsLock.unlock();
             }
-            devicesExecutionPool.forEach(future -> future.cancel(true));
-            devicesExecutionPool.clear();
+            Thread running = cycleThread;
+            if (running != null) {
+                running.interrupt();
+            }
 
             aggregatedDevices.clear();
             zoomRoomsMetricsData.clear();
@@ -1558,9 +1482,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
             logDebugMessage("Attempt to generate OAuth token with credentials: " + oauthPair);
             headers.add("Authorization", "Basic " + Base64.getEncoder().encodeToString(oauthPair.getBytes(StandardCharsets.UTF_8)));
         } else {
-            if (authorization == null) {
-                authenticate();
-            }
+            ensureAuthorized();
             headers.add("Authorization", "Bearer " + authorization.getAccessToken());
         }
         return super.putExtraRequestHeaders(httpMethod, uri, headers);
@@ -1572,40 +1494,20 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
     @Override
     public List<AggregatedDevice> retrieveMultipleStatistics() throws Exception {
         logger.debug("ZoomRooms: Retrieve multiple statistics call");
-        logDebugMessage(String.format("Adapter initialized: %s, executorService exists: %s, DataLoader running: %s, devicesExecutionPool: %s, dataLoader idle: %s", isInitialized(), executorService != null, deviceDataLoader.isInProgress(), devicesExecutionPool.size(), deviceDataLoader.isIdle()));
-        if (authorization == null || authorization.updateRequired()) {
-            logDebugMessage("Unable to find oAuthAccessToken, regenerating.");
-            authorizationLock.lock();
-            try {
-                authenticate();
-            } finally {
-                authorizationLock.unlock();
-            }
-        }
+        ensureAuthorized();
         updateValidRetrieveStatisticsTimestamp();
-//        logDebugMessage(String.format("Adapter initialized: %s, executorService exists: %s, DataLoader running: %s, devicesExecutionPool: %s, dataLoader idle: %s", isInitialized(), executorService != null, deviceDataLoader.isInProgress(), devicesExecutionPool.size(), deviceDataLoader.isIdle()));
         dataCollectorOperationsLock.lock();
         try {
             if (executorService == null) {
-                logger.warn("No executor service found, creating executor service.");
-                // Due to the bug that after changing properties on fly - the adapter is destroyed but adapter is not initialized properly,
-                // so executor service is not running. We need to make sure executorService exists
-                executorService = Executors.newFixedThreadPool(executorServiceThreadCount);
+                // CommProxy mode: the loader starts with the first request for statistics, and again after an on-the-fly
+                // properties change destroyed the adapter without initializing it properly
+                logDebugMessage("Starting the device data loader.");
+                // one thread runs the loader itself, the others collect room details
+                executorService = Executors.newFixedThreadPool(executorServiceThreadCount + 1);
                 executorService.submit(deviceDataLoader = new ZoomRoomsDeviceDataLoader());
                 serviceRunning = true;
             } else if (deviceDataLoader.isIdle()) {
                 logger.warn("DeviceDataLoader is in idle state.");
-                //TODO: uncomment this for 1.2.7
-//                logger.warn("DeviceDataLoader is in idle state, restarting.");
-//                if (!executorService.isShutdown()) {
-//                    executorService.shutdownNow();
-//                }
-//                if (deviceDataLoader != null) {
-//                    deviceDataLoader.stop();
-//                }
-//                executorService = Executors.newFixedThreadPool(executorServiceThreadCount);
-//                executorService.submit(deviceDataLoader = new ZoomRoomsDeviceDataLoader());
-//                serviceRunning = true;
             }
         } finally {
             dataCollectorOperationsLock.unlock();
@@ -1616,7 +1518,195 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
         long currentTimestamp = System.currentTimeMillis();
         nextDevicesCollectionIterationTimestamp = currentTimestamp;
         logDebugMessage("Zoom Rooms Collected Devices: " + aggregatedDevices.values());
+        refreshRoomsInCall(currentTimestamp);
+        throwCollectionErrors();
+        return new ArrayList<>(aggregatedDevices.values());
+    }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * A {@link PollContext.Reason#WEBHOOK WEBHOOK} cycle makes no Zoom requests: it reports the rooms with the webhook
+     * events folded in. A failed rooms list, metrics or room group is reported in the result's errors, the rest is still
+     * collected; a login failure or an unreachable Zoom API is thrown after the cycle.
+     */
+    @Override
+    public PollResult poll(PollContext context) throws Exception {
+        return singleFlight(() -> {
+            boolean complete = true;
+            List<Statistics> aggregatorStatistics = Collections.emptyList();
+            if (context.getReason() != PollContext.Reason.WEBHOOK) {
+                complete = collect(context);
+                aggregatorStatistics = getMultipleStatistics();
+            }
+            long now = System.currentTimeMillis();
+            refreshRoomsInCall(now);
+            List<AggregatedDevice> devices = snapshot();
+            throwCollectionErrors();
+            return PollResult.builder()
+                    .aggregatorStatistics(aggregatorStatistics)
+                    .devices(devices)
+                    .complete(complete)
+                    .errors(knownErrors)
+                    .nextNotBefore(metricsBlockedUntil > now ? Instant.ofEpochMilli(metricsBlockedUntil) : null)
+                    .build();
+        });
+    }
+
+    /**
+     * Runs {@code cycle} unless a cycle is already running; then waits for that one and returns its result instead.
+     * A cycle interrupted on another thread is not shared: the waiter runs its own.
+     */
+    private PollResult singleFlight(Callable<PollResult> cycle) throws Exception {
+        CompletableFuture<PollResult> own = new CompletableFuture<>();
+        while (!cycleInFlight.compareAndSet(null, own)) {
+            CompletableFuture<PollResult> running = cycleInFlight.get();
+            if (running == null) {
+                continue;
+            }
+            try {
+                return running.get();
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof InterruptedException) {
+                    continue;
+                }
+                if (cause instanceof Exception) {
+                    throw (Exception) cause;
+                }
+                throw new IllegalStateException(cause);
+            }
+        }
+        cycleThread = Thread.currentThread();
+        try {
+            PollResult result = cycle.call();
+            own.complete(result);
+            return result;
+        } catch (Exception | Error e) {
+            own.completeExceptionally(e);
+            throw e;
+        } finally {
+            cycleThread = null;
+            cycleInFlight.set(null);
+        }
+    }
+
+    /**
+     * One collection: the rooms list, the rooms metrics, then every room's details on the context's executor. Each step
+     * keeps its own cooldown; a failed step is recorded in {@link #knownErrors} or {@link #unreachableErrors} and the
+     * next one still runs.
+     *
+     * @return {@code false} if the deadline cut the room details short
+     * @throws InterruptedException if the calling thread is interrupted; the interrupt flag is kept
+     */
+    private boolean collect(PollContext context) throws InterruptedException {
+        long startCycle = System.currentTimeMillis();
+        try {
+            logDebugMessage("Fetching devices list.");
+            // Errors are not cleared per cycle: each one stays until the operation that raised it succeeds,
+            // since most operations run in cooldown and a per-cycle clear would hide an unresolved error
+            fetchDevicesList();
+        } catch (Exception e) {
+            rethrowIfInterrupted(e);
+            ResourceNotReachableException unreachable = findUnreachable(e);
+            if (unreachable != null) {
+                // Thrown to the callers of get/retrieveMultipleStatistics until the rooms list is retrieved again
+                unreachableErrors.put(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY, unreachable);
+            } else {
+                knownErrors.put(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
+            }
+            logger.error("Error occurred during device list retrieval.", e);
+        }
+        if (aggregatedDevices.isEmpty()) {
+            return true;
+        }
+        try {
+            // The following request collect all the information, so in order to save number of requests, which is
+            // daily limited for certain APIs, we need to request them once per monitoring cycle.
+            retrieveZoomRoomMetrics();
+        } catch (Exception e) {
+            rethrowIfInterrupted(e);
+            ResourceNotReachableException unreachable = findUnreachable(e);
+            if (unreachable != null) {
+                // Thrown to the callers of get/retrieveMultipleStatistics until the metrics are retrieved again
+                unreachableErrors.put(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY, unreachable);
+            } else {
+                knownErrors.put(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
+            }
+            logger.error("Error occurred during ZoomRooms metrics retrieval.", e);
+        }
+        boolean complete = collectRoomDetails(context);
+        lastMonitoringCycleDuration = Math.max((System.currentTimeMillis() - startCycle) / 1000, 1L);
+        return complete;
+    }
+
+    /**
+     * Collects every room's details in parallel on the context's executor. Rooms not done by the deadline are cancelled
+     * and keep their last values.
+     *
+     * @return {@code false} if the deadline passed or the executor refused a room
+     */
+    private boolean collectRoomDetails(PollContext context) throws InterruptedException {
+        List<FutureTask<Void>> rooms = new ArrayList<>();
+        try {
+            for (Map.Entry<String, AggregatedDevice> entry : aggregatedDevices.entrySet()) {
+                String deviceId = entry.getValue().getDeviceId();
+                if (entry.getKey().startsWith(ROOM_DEVICE_ID_PREFIX)) {
+                    // room devices are collected with their room
+                    knownErrors.remove(deviceId);
+                    continue;
+                }
+                String deviceName = entry.getValue().getDeviceName();
+                FutureTask<Void> room = new FutureTask<>(() -> {
+                    try {
+                        populateDeviceDetails(deviceId);
+                        knownErrors.remove(deviceId);
+                    } catch (Exception e) {
+                        knownErrors.put(deviceId, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
+                        logger.error(String.format("Exception during Zoom Room '%s' data processing.", deviceName), e);
+                    }
+                    return null;
+                });
+                rooms.add(room);
+                context.getExecutor().execute(room);
+            }
+            for (FutureTask<Void> room : rooms) {
+                room.get(Math.max(Duration.between(Instant.now(), context.getDeadline()).toMillis(), 0L), TimeUnit.MILLISECONDS);
+            }
+            return true;
+        } catch (TimeoutException | RejectedExecutionException e) {
+            logger.warn("Zoom Rooms details collection is cut short: " + e);
+            rooms.forEach(room -> room.cancel(true));
+            return false;
+        } catch (InterruptedException e) {
+            rooms.forEach(room -> room.cancel(true));
+            Thread.currentThread().interrupt();
+            throw e;
+        } catch (ExecutionException e) {
+            // the task catches every Exception: only an Error gets here
+            rooms.forEach(room -> room.cancel(true));
+            throw new IllegalStateException(e.getCause());
+        }
+    }
+
+    /** Throws {@code e} as an {@link InterruptedException}, flag kept, if it was caused by an interruption. */
+    private static void rethrowIfInterrupted(Exception e) throws InterruptedException {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                throw (InterruptedException) cause;
+            }
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("Zoom Rooms cycle interrupted");
+        }
+    }
+
+    /**
+     * Sets every room's inCall from its metrics' room status (or the webhook value holding over it) and marks offline
+     * rooms' uptime.
+     */
+    private void refreshRoomsInCall(long currentTimestamp) {
         for (Map.Entry<String, AggregatedDevice> deviceEntry: aggregatedDevices.entrySet()) {
             String deviceKey = deviceEntry.getKey();
             if (deviceKey.startsWith(ROOM_DEVICE_ID_PREFIX)) {
@@ -1633,22 +1723,97 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator implements
                 applyRoomInCall(aggregatedDevice, callStatus);
                 Boolean deviceOnline = aggregatedDevice.getDeviceOnline();
                 if (!deviceOnline) {
-                    properties.put(PropertyNameConstants.METRICS_DATA_DEVICE_UPTIME, "ZR Offline");
-                    properties.put(PropertyNameConstants.METRICS_DATA_DEVICE_UPTIME_MIN, "ZR Offline");
+                    synchronized (aggregatedDevice) {
+                        properties.put(PropertyNameConstants.METRICS_DATA_DEVICE_UPTIME, "ZR Offline");
+                        properties.put(PropertyNameConstants.METRICS_DATA_DEVICE_UPTIME_MIN, "ZR Offline");
+                    }
                 }
             } catch (Exception e) {
                 logger.error("An error occurred during call status setting for room " + aggregatedDevice.getDeviceId() + ":" + callStatus, e);
             }
         }
+    }
+
+    /**
+     * Throws a login failure or an unreachable Zoom API recorded by the collection, so the caller marks the adapter;
+     * the collection keeps running and clears them once Zoom answers again.
+     */
+    private void throwCollectionErrors() throws Exception {
         if (knownErrors.containsKey(PropertyNameConstants.LOGIN_ERROR_KEY)) {
             // Need to call it here to still have all the operations running and make sure errors are checked.
             // Otherwise, the runner will consider device paused
             authorization = null;
             throw new RuntimeException(knownErrors.get(PropertyNameConstants.LOGIN_ERROR_KEY));
         }
-        // Here for the same reason: the background collection keeps running, so it can clear the error once the API answers
         throwIfUnreachable();
-        return new ArrayList<>(aggregatedDevices.values());
+    }
+
+    /**
+     * Copies of every device, so the caller owns what it gets: later cycles, webhook events and controls never change
+     * them. Taken under the adapter's lock, which {@link #setRoomInCall} holds, and each room's lock, which the details
+     * collection holds while it replaces the room's properties.
+     */
+    private synchronized List<AggregatedDevice> snapshot() {
+        List<AggregatedDevice> copies = new ArrayList<>(aggregatedDevices.size());
+        for (AggregatedDevice device : aggregatedDevices.values()) {
+            synchronized (device) {
+                copies.add(copyOf(device));
+            }
+        }
+        return copies;
+    }
+
+    private static AggregatedDevice copyOf(AggregatedDevice source) {
+        AggregatedDevice copy = new AggregatedDevice();
+        copy.setDeviceId(source.getDeviceId());
+        copy.setDeviceName(source.getDeviceName());
+        copy.setDeviceMake(source.getDeviceMake());
+        copy.setDeviceModel(source.getDeviceModel());
+        copy.setDeviceType(source.getDeviceType());
+        copy.setCategory(source.getCategory());
+        copy.setType(source.getType());
+        copy.setDeviceOnline(source.getDeviceOnline());
+        copy.setSerialNumber(source.getSerialNumber());
+        copy.setAviSplAssetId(source.getAviSplAssetId());
+        copy.setOwnerAssetId(source.getOwnerAssetId());
+        copy.setTimestamp(source.getTimestamp());
+        copy.setMacAddresses(source.getMacAddresses() == null ? null : new ArrayList<>(source.getMacAddresses()));
+        copy.setStatistics(source.getStatistics() == null ? null : new HashMap<>(source.getStatistics()));
+        copy.setDynamicStatistics(source.getDynamicStatistics() == null ? null : new HashMap<>(source.getDynamicStatistics()));
+        copy.setProperties(source.getProperties() == null ? null : new HashMap<>(source.getProperties()));
+        copy.setControl(source.getControl() == null ? null : new HashMap<>(source.getControl()));
+        copy.setMonitoredStatistics(source.getMonitoredStatistics() == null ? null : new ArrayList<>(source.getMonitoredStatistics()));
+        copy.setControllableProperties(source.getControllableProperties() == null ? null : new ArrayList<>(source.getControllableProperties()));
+        return copy;
+    }
+
+    /**
+     * Requests an OAuth token if there is none or it is half expired; concurrent callers wait for one request.
+     */
+    private void ensureAuthorized() throws Exception {
+        Authorization current = authorization;
+        if (current != null && !current.updateRequired()) {
+            return;
+        }
+        authorizationLock.lock();
+        try {
+            if (authorization == null || authorization.updateRequired()) {
+                logDebugMessage("Unable to find oAuthAccessToken, regenerating.");
+                authenticate();
+            }
+        } finally {
+            authorizationLock.unlock();
+        }
+    }
+
+    /** The monitoring interval in ms; 60 s on Cloud Connector versions without {@code getMonitoringRate}. */
+    private long monitoringRateMillis() {
+        try {
+            return getMonitoringRate() * 60000L;
+        } catch (NoSuchMethodError nsme) {
+            logger.warn("Unsupported feature: getMonitoringRate isn't available on current Cloud Connector version.", nsme);
+            return 60000L;
+        }
     }
 
     /**
