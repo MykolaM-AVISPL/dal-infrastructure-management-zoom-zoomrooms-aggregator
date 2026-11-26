@@ -8,6 +8,7 @@ setup-steps:
   - "In the same app open Features → Access → Event Subscription, add a subscription with the Webhook URL above."
   - "Authentication header: Basic, with the webhook user and password above."
   - "Events: Meeting → Start Meeting, End Meeting, Participant/Host joined meeting, Participant/Host left meeting."
+  - "Optional: Zoom Room → Zoom Room Alert (zoomroom.alert, Business or Enterprise plans) to learn at once when a room goes offline or online, and Zoom Room → created, updated, deleted to learn about room changes before the next poll."
   - "Copy the app's secret token into Webhook secret token below and save here first, then select Validate in Zoom."
 settings:
   accountId:

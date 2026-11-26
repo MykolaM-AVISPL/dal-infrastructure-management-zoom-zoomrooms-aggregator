@@ -49,7 +49,8 @@ public class PropertyNameConstants {
     public static final String DEVICE_SYSTEM_PROPERTY = "DeviceSystem";
     public static final String DEVICE_STATUS_PROPERTY = "DeviceStatus";
     public static final String ROOM_DEVICES_TEMPLATE_PROPERTY = "RoomDevices%ss#%s";
-    public static final String ROOM_DEVICES_GROUP = "RoomDevices#";
+    /** Prefix of every {@link #ROOM_DEVICES_TEMPLATE_PROPERTY} key, e.g. RoomDevicesControllers#OnlineDevicesTotal */
+    public static final String ROOM_DEVICES_GROUP = "RoomDevices";
     public static final String ONLINE_APP_VERSIONS_PROPERTY = "OnlineAppVersions";
     public static final String OFFLINE_APP_VERSIONS_PROPERTY = "OfflineAppVersions";
     public static final String ONLINE_DEVICE_SYSTEMS_PROPERTY = "OnlineDeviceSystems";
