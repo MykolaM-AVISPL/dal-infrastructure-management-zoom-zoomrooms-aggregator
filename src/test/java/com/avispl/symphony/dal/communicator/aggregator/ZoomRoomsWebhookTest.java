@@ -135,21 +135,19 @@ public class ZoomRoomsWebhookTest {
     // ---- classifier: what digest asks the host for
 
     @Test
-    public void digest_shouldApplyAndPollRoom_whenRoomUserStartsAMeeting() throws Exception {
+    public void digest_shouldPollRoom_whenRoomUserStartsAMeeting() throws Exception {
         DigestPlan plan = communicator.digest(Collections.singletonList(event(1, "meeting.started", ROOM_USER_ID, System.currentTimeMillis())));
 
-        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getApplied());
         Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getPollDevices());
     }
 
     @Test
-    public void digest_shouldApplyAndPollRoom_whenRoomJoinsAndItsJoinedMeetingEnds() throws Exception {
+    public void digest_shouldPollRoom_whenRoomJoinsAndItsJoinedMeetingEnds() throws Exception {
         long now = System.currentTimeMillis();
         communicator.digest(Collections.singletonList(participant(1, "meeting.participant_joined", "m42", "someHost", ROOM_USER_ID, now - 1000)));
 
         DigestPlan plan = communicator.digest(Collections.singletonList(meeting(2, "meeting.ended", "m42", "someHost", now)));
 
-        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getApplied());
         Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getPollDevices());
     }
 
@@ -164,49 +162,20 @@ public class ZoomRoomsWebhookTest {
     }
 
     @Test
-    public void digest_shouldApplyOfflineWithAlertTime_whenAlertSaysRoomIsOffline() throws Exception {
-        long alertTime = System.currentTimeMillis() - 2000;
+    public void digest_shouldPollRoomAndLeaveItsOnlineToThePoll_whenAlertSaysRoomIsOffline() throws Exception {
+        DigestPlan plan = communicator.digest(Collections.singletonList(alert(1, "zoomroom.alert", ROOM_ID, "Zoom room is offline", System.currentTimeMillis())));
 
-        DigestPlan plan = communicator.digest(Collections.singletonList(alert(1, "zoomroom.alert", ROOM_ID, "Zoom room is offline", alertTime)));
-
-        Assertions.assertEquals(Boolean.FALSE, room.getDeviceOnline());
-        Assertions.assertEquals(alertTime, (long) observedAt().get("online"));
-        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getApplied());
-        Assertions.assertTrue(plan.getPollDevices().isEmpty());
+        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getPollDevices());
+        Assertions.assertEquals(Boolean.TRUE, room.getDeviceOnline(), "online comes from the rooms list of the poll");
     }
 
     @Test
-    public void digest_shouldApplyOnline_whenDelayedAlertNamesTheRoomUserAndSaysOnline() throws Exception {
-        room.setDeviceOnline(false);
+    public void digest_shouldPollRoom_whenDelayedAlertNamesTheRoomUser() throws Exception {
         WebhookEvent delayedOnline = alert(1, "zoomroom.delayed_alert", ROOM_USER_ID, "Zoom Room is online.", System.currentTimeMillis());
 
         DigestPlan plan = communicator.digest(Collections.singletonList(delayedOnline));
 
-        Assertions.assertEquals(Boolean.TRUE, room.getDeviceOnline());
-        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getApplied());
-    }
-
-    @Test
-    public void digest_shouldKeepOnline_whenAlertIsOlderThanTheKnownOnlineTime() throws Exception {
-        long now = System.currentTimeMillis();
-        communicator.digest(Collections.singletonList(alert(1, "zoomroom.alert", ROOM_ID, "Zoom room is offline", now)));
-
-        DigestPlan plan = communicator.digest(Collections.singletonList(alert(2, "zoomroom.alert", ROOM_ID, "Zoom room is online", now - 1000)));
-
-        Assertions.assertEquals(Boolean.FALSE, room.getDeviceOnline());
-        Assertions.assertEquals(now, (long) observedAt().get("online"));
-        Assertions.assertTrue(plan.isEmpty(), plan.toString());
-    }
-
-    @Test
-    public void digest_shouldTimeOnlineByEventTs_whenAlertHasNoAlertTime() throws Exception {
-        long eventTs = System.currentTimeMillis() - 3000;
-        String body = "{\"event\":\"zoomroom.alert\",\"event_ts\":" + eventTs + ",\"payload\":{\"object\":{\"id\":\"" + ROOM_ID
-                + "\",\"issue\":\"Zoom room is offline\"}}}";
-
-        communicator.digest(Collections.singletonList(new WebhookEvent(1, new Date(), body)));
-
-        Assertions.assertEquals(eventTs, (long) observedAt().get("online"));
+        Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getPollDevices());
     }
 
     @Test
@@ -215,8 +184,6 @@ public class ZoomRoomsWebhookTest {
 
         DigestPlan plan = communicator.digest(Collections.singletonList(camera));
 
-        Assertions.assertEquals(Boolean.TRUE, room.getDeviceOnline());
-        Assertions.assertTrue(plan.getApplied().isEmpty());
         Assertions.assertEquals(Collections.singleton(ROOM_ID), plan.getPollDevices());
     }
 
@@ -429,13 +396,6 @@ public class ZoomRoomsWebhookTest {
         Method details = ZoomRoomsAggregatorCommunicator.class.getDeclaredMethod("populateDeviceDetails", String.class);
         details.setAccessible(true);
         details.invoke(communicator, ROOM_ID);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Long> observedAt() throws Exception {
-        Field f = ZoomRoomsAggregatorCommunicator.class.getDeclaredField("observedAt");
-        f.setAccessible(true);
-        return ((Map<String, Map<String, Long>>) f.get(communicator)).get(ROOM_ID);
     }
 
     @SuppressWarnings("unchecked")

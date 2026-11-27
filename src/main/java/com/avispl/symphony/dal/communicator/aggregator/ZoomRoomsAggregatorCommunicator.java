@@ -109,9 +109,28 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         void process(JsonNode response);
     }
 
-    /** One property group's collection for a room, see {@link #collectRoomGroup}: {@code true} when Zoom answered with the group's values. */
+    /** How a room's property group was collected in this cycle, see {@link #collectRoomGroup}. */
+    private enum Group {
+        /** Zoom answered with the group's values. */
+        FETCHED,
+        /** Nothing to ask (switched off, nothing in Zoom, over a limit): the room keeps no value of the group from an earlier cycle. */
+        SKIPPED,
+        /** In cooldown, or the request failed: the room keeps the group's values from an earlier cycle. */
+        STALE
+    }
+
+    /** One property group's collection for a room, see {@link #collectRoomGroup}. */
     private interface RoomGroupCollector {
-        boolean collect() throws Exception;
+        Group collect() throws Exception;
+    }
+
+    /** What one {@link #collect} did: whether it ended before the deadline, the rooms Zoom listed, the rooms it polled in full. */
+    private static final class CycleOutcome {
+        boolean complete;
+        /** Every room id Zoom listed in this cycle, subscribed or not; {@code null} if the rooms list was not requested or failed. */
+        Set<String> listed;
+        /** Rooms whose every value came from Zoom in this cycle: the rooms list, the metrics and each of the room's groups. */
+        final Set<String> polled = ConcurrentHashMap.newKeySet();
     }
 
     /** One room's metrics from a page of the rooms metrics, see {@link #fetchMetricsPages}. */
@@ -163,7 +182,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                     }
                     // CommProxy mode has no deadline: the cycle collects every room, however long it takes
                     PollContext context = new PollContext(pool, Instant.now().plus(Duration.ofDays(1)), PollContext.Reason.SCHEDULE);
-                    singleFlight(() -> PollResult.builder().complete(collect(context)).build());
+                    singleFlight(() -> PollResult.builder().complete(collect(context).complete).build());
                     if (aggregatedDevices.isEmpty()) {
                         logDebugMessage("No devices collected in the main data collection thread so far. Continuing.");
                         continue;
@@ -1579,22 +1598,19 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * A {@link PollContext.Reason#SCHEDULE SCHEDULE} or {@link PollContext.Reason#MANUAL MANUAL} cycle sets the subscription to
      * {@link PollContext#getDevices()}: the rooms list and the metrics are still requested account-wide, but only the subscribed rooms are
      * kept and asked about one by one. An {@link PollContext.Reason#EVENT EVENT} cycle keeps the subscription, refreshes both lists and asks
-     * about the context's rooms only. A {@link PollContext.Reason#WEBHOOK WEBHOOK} cycle makes no Zoom requests: it reports the rooms with the
-     * webhook events folded in. A failed rooms list, metrics or room group is reported in the result's errors, the rest is still collected; a
-     * login failure or an unreachable Zoom API is thrown after the cycle.
+     * about the context's rooms only. Only the rooms polled in full are reported, with their room devices: the rooms list and the metrics came
+     * in this cycle, and so did each of the room's groups. A room the deadline cut, a group in cooldown or a failed request leaves the room
+     * out, never filled in from the cache. A failed rooms list, metrics or room group is reported in the result's errors, the rest is still
+     * collected; a login failure or an unreachable Zoom API is thrown after the cycle.
      */
     @Override
     public PollResult poll(PollContext context) throws Exception {
-        if (context.getReason() == PollContext.Reason.WEBHOOK) {
-            // no Zoom requests: never shared with a running collection, nor held up by it
-            return result(true, Collections.emptyList());
-        }
         return singleFlight(() -> {
             if (context.getReason() != PollContext.Reason.EVENT) {
                 subscribe(context.getDevices());
             }
-            boolean complete = collect(context);
-            return result(complete, getMultipleStatistics());
+            CycleOutcome outcome = collect(context);
+            return result(outcome, getMultipleStatistics());
         });
     }
 
@@ -1606,11 +1622,20 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         }
     }
 
-    /** The rooms as they are now, with inCall and timestamps refreshed; throws a recorded login failure or unreachable API. */
-    private PollResult result(boolean complete, List<Statistics> aggregatorStatistics) throws Exception {
+    /** The rooms the cycle polled in full, with inCall and timestamps refreshed; throws a recorded login failure or unreachable API. */
+    private PollResult result(CycleOutcome outcome, List<Statistics> aggregatorStatistics) throws Exception {
         long now = System.currentTimeMillis();
         refreshRoomsInCall();
-        List<AggregatedDevice> devices = snapshot();
+        List<AggregatedDevice> devices = snapshot(outcome.polled);
+        Set<String> listed = null;
+        if (outcome.listed != null) {
+            listed = new HashSet<>(outcome.listed);
+            for (Map.Entry<String, AggregatedDevice> entry : aggregatedDevices.entrySet()) {
+                if (entry.getKey().startsWith(ROOM_DEVICE_ID_PREFIX)) {
+                    listed.add(entry.getValue().getDeviceId());
+                }
+            }
+        }
         Map<String, Map<String, Long>> times = new HashMap<>();
         for (AggregatedDevice device : devices) {
             Map<String, Long> deviceTimes = observedAt.get(device.getDeviceId());
@@ -1622,7 +1647,8 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         return PollResult.builder()
                 .aggregatorStatistics(aggregatorStatistics)
                 .devices(devices)
-                .complete(complete)
+                .complete(outcome.complete)
+                .listed(listed)
                 .errors(knownErrors)
                 .nextNotBefore(metricsBlockedUntil > now ? Instant.ofEpochMilli(metricsBlockedUntil) : null)
                 .observedAt(times)
@@ -1813,16 +1839,16 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * {@link PollContext.Reason#EVENT EVENT} cycle, the details of the context's rooms only). Each step keeps its own cooldown; a failed step
      * is recorded in {@link #knownErrors} or {@link #unreachableErrors} and the next one still runs.
      *
-     * @return {@code false} if the deadline cut the room details short
      * @throws InterruptedException if the calling thread is interrupted; the interrupt flag is kept
      */
-    private boolean collect(PollContext context) throws InterruptedException {
+    private CycleOutcome collect(PollContext context) throws InterruptedException {
         long startCycle = System.currentTimeMillis();
+        CycleOutcome outcome = new CycleOutcome();
         try {
             logDebugMessage("Fetching devices list.");
             // Errors are not cleared per cycle: each one stays until the operation that raised it succeeds,
             // since most operations run in cooldown and a per-cycle clear would hide an unresolved error
-            fetchDevicesList();
+            outcome.listed = fetchDevicesList();
         } catch (Exception e) {
             rethrowIfInterrupted(e);
             ResourceNotReachableException unreachable = findUnreachable(e);
@@ -1835,15 +1861,17 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             logger.error("Error occurred during device list retrieval.", e);
         }
         if (aggregatedDevices.isEmpty()) {
-            return true;
+            outcome.complete = true;
+            return outcome;
         }
         if (context.isExpired()) {
-            return false;
+            return outcome;
         }
+        boolean metricsFetched = false;
         try {
             // The following request collect all the information, so in order to save number of requests, which is
             // daily limited for certain APIs, we need to request them once per monitoring cycle.
-            retrieveZoomRoomMetrics();
+            metricsFetched = retrieveZoomRoomMetrics();
         } catch (Exception e) {
             rethrowIfInterrupted(e);
             ResourceNotReachableException unreachable = findUnreachable(e);
@@ -1856,9 +1884,13 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             logger.error("Error occurred during ZoomRooms metrics retrieval.", e);
         }
         Set<String> detailed = context.getReason() == PollContext.Reason.EVENT ? context.getDevices() : null;
-        boolean complete = !context.isExpired() && collectRoomDetails(context, detailed);
+        Set<String> detailedInFull = ConcurrentHashMap.newKeySet();
+        outcome.complete = !context.isExpired() && collectRoomDetails(context, detailed, detailedInFull);
+        if (outcome.listed != null && metricsFetched) {
+            outcome.polled.addAll(detailedInFull);
+        }
         lastMonitoringCycleDuration = Math.max((System.currentTimeMillis() - startCycle) / 1000, 1L);
-        return complete;
+        return outcome;
     }
 
     /**
@@ -1868,9 +1900,10 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * oldest ({@link #detailsCollectedAt}) go first, so a deadline never leaves out the same rooms cycle after cycle.
      *
      * @param detailed ids of the rooms to collect, {@code null} for every cached room
+     * @param inFull filled with the rooms whose every group came from Zoom in this collection
      * @return {@code false} if the deadline passed or the executor refused a room
      */
-    private boolean collectRoomDetails(PollContext context, Set<String> detailed) throws InterruptedException {
+    private boolean collectRoomDetails(PollContext context, Set<String> detailed, Set<String> inFull) throws InterruptedException {
         List<AggregatedDevice> cachedRooms = new ArrayList<>();
         for (Map.Entry<String, AggregatedDevice> entry : aggregatedDevices.entrySet()) {
             if (entry.getKey().startsWith(ROOM_DEVICE_ID_PREFIX)) {
@@ -1894,8 +1927,11 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                 String deviceName = cachedRoom.getDeviceName();
                 FutureTask<Void> room = new FutureTask<>(() -> {
                     try {
-                        populateDeviceDetails(deviceId);
+                        boolean fetched = populateDeviceDetails(deviceId);
                         knownErrors.remove(deviceId);
+                        if (fetched && !Thread.currentThread().isInterrupted()) {
+                            inFull.add(deviceId);
+                        }
                     } catch (Exception e) {
                         knownErrors.put(deviceId, limitErrorMessageByLength(e.getMessage(), maxErrorLength));
                         logger.error(String.format("Exception during Zoom Room '%s' data processing.", deviceName), e);
@@ -2036,13 +2072,17 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
     }
 
     /**
-     * Copies of every device, so the caller owns what it gets: later cycles, webhook events and controls never change
-     * them. Taken under the adapter's lock, which {@link #setRoomInCall} holds, and each room's lock, which the details
-     * collection holds while it replaces the room's properties.
+     * Copies of the given rooms and their room devices, so the caller owns what it gets: later cycles, webhook events and controls never
+     * change them. Taken under the adapter's lock, which {@link #setRoomInCall} holds, and each room's lock, which the details collection
+     * holds while it replaces the room's properties.
      */
-    private synchronized List<AggregatedDevice> snapshot() {
-        List<AggregatedDevice> copies = new ArrayList<>(aggregatedDevices.size());
-        for (AggregatedDevice device : aggregatedDevices.values()) {
+    private synchronized List<AggregatedDevice> snapshot(Set<String> roomIds) {
+        List<AggregatedDevice> copies = new ArrayList<>();
+        for (Map.Entry<String, AggregatedDevice> entry : aggregatedDevices.entrySet()) {
+            AggregatedDevice device = entry.getValue();
+            if (!roomIds.contains(entry.getKey().startsWith(ROOM_DEVICE_ID_PREFIX) ? roomIdOf(device) : entry.getKey())) {
+                continue;
+            }
             synchronized (device) {
                 copies.add(copyOf(device));
             }
@@ -2148,13 +2188,12 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
     }
 
     /**
-     * Classifies Zoom webhook events, folds the values they carry into the adapter's state and says what else the host should do. Only the
+     * Classifies Zoom webhook events and says which rooms the host should poll; nothing is reported by an event itself. Only the
      * kept rooms count (a meeting's room by its user id, a zoomroom event's by its room id or user id); other rooms are logged and skipped.
      * <ul>
-     * <li>meeting.started / ended, participant_joined / left: the room's {@link EndpointStatistics#setInCall(Boolean) inCall} at once, timed by
-     * the event; applied, and the room is polled for the meeting's details once Zoom has settled;</li>
-     * <li>zoomroom.alert / delayed_alert "Zoom room is offline" / "online": the room's online, timed by the alert, unless a newer one is
-     * known; applied. Any other alert: the room is polled;</li>
+     * <li>meeting.started / ended, participant_joined / left: the room's {@link EndpointStatistics#setInCall(Boolean) inCall}, timed by the
+     * event, is kept for the poll the room gets once Zoom has settled (the metrics lag behind the meeting);</li>
+     * <li>zoomroom.alert / delayed_alert: the room is polled, its online comes from the rooms list;</li>
      * <li>zoomroom.updated: the room is polled. zoomroom.created / deleted: the inventory changed; a deleted kept room is polled too.</li>
      * </ul>
      * An inCall value holds until a metrics retrieval at least {@link #WEBHOOK_OVERRIDE_SETTLE_MS} after the event, from then on
@@ -2195,7 +2234,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                     applyParticipantEvent(event.getSequence(), parsed, false, at, plan);
                     break;
                 case ROOM_ALERT:
-                    applyRoomAlert(event.getSequence(), parsed, parsed.getAlertTime() != null ? parsed.getAlertTime().toEpochMilli() : at, plan);
+                    pollKeptRoom(event.getSequence(), parsed, plan);
                     break;
                 case ROOM_UPDATED:
                     pollKeptRoom(event.getSequence(), parsed, plan);
@@ -2259,7 +2298,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         }
     }
 
-    /** Applies the room's inCall from a meeting event; the room is then polled for the details the event does not carry. */
+    /** Keeps the room's inCall from a meeting event for its next poll, and asks for that poll. */
     private void applyInCall(long sequence, String roomId, boolean inCall, long at, String meetingId, DigestPlan.Builder plan) {
         InCallOverride current = webhookInCallOverrides.get(roomId);
         if (current != null && current.at > at) {
@@ -2271,38 +2310,8 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         if (room != null) {
             setRoomInCall(room, inCall, true);
         }
-        plan.applied(roomId).pollDevice(roomId);
+        plan.pollDevice(roomId);
         logger.info(String.format("Webhook event %s: room %s inCall=%s (meeting %s)", sequence, roomId, inCall, meetingId));
-    }
-
-    /**
-     * A zoomroom alert: "Zoom room is offline" / "online" applies the room's online at {@code at} unless a newer value is known; any other
-     * issue names a problem without its value, so the room is polled.
-     */
-    private void applyRoomAlert(long sequence, ZoomWebhookEvent event, long at, DigestPlan.Builder plan) {
-        String roomId = keptRoom(sequence, event);
-        if (roomId == null) {
-            return;
-        }
-        Boolean online = event.getRoomOnline();
-        if (online == null) {
-            logDebugMessage(String.format("Webhook event %s: room %s alert '%s', polling the room", sequence, roomId, event.getIssue()));
-            plan.pollDevice(roomId);
-            return;
-        }
-        AggregatedDevice room = aggregatedDevices.get(roomId);
-        Map<String, Long> times = observedAt.computeIfAbsent(roomId, id -> new ConcurrentHashMap<>());
-        synchronized (room) {
-            Long known = times.get(ONLINE_KEY);
-            if (known != null && known >= at) {
-                logger.info(String.format("Webhook event %s for room %s is older than the room's online status, skipped", sequence, roomId));
-                return;
-            }
-            room.setDeviceOnline(online);
-            times.put(ONLINE_KEY, at);
-        }
-        plan.applied(roomId);
-        logger.info(String.format("Webhook event %s: room %s online=%s", sequence, roomId, online));
     }
 
     /** Asks the host to poll the kept room a zoomroom event names. */
@@ -2363,19 +2372,20 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * csv list of Location Names, e.g "Country/Region1", "State1" etc.
      * <p>
      *
+     * @return every room id Zoom listed, subscribed or not; {@code null} if the list is in cooldown
      * @throws Exception if a communication error occurs
      */
-    private void fetchDevicesList() throws Exception {
+    private Set<String> fetchDevicesList() throws Exception {
         long currentTimestamp = System.currentTimeMillis();
         if (validDeviceMetaDataRetrievalPeriodTimestamp > currentTimestamp) {
             logDebugMessage(String.format("General devices metadata retrieval is in cooldown. %s seconds left",
                     (validDeviceMetaDataRetrievalPeriodTimestamp - currentTimestamp) / 1000));
-            return;
+            return null;
         }
         validDeviceMetaDataRetrievalPeriodTimestamp = currentTimestamp + deviceMetaDataRetrievalTimeout;
 
         List<String> listedRoomIds = new ArrayList<>();
-        fetchRooms(listedRoomIds);
+        Set<String> zoomRoomIds = fetchRooms(listedRoomIds);
         Set<String> retrievedRoomIds = new HashSet<>(listedRoomIds);
         // Rooms Zoom no longer lists (or the subscription left out) go, and so do their devices; a kept room's devices are listed again
         // with the room's details
@@ -2394,14 +2404,16 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         knownErrors.remove(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY);
         unreachableErrors.remove(PropertyNameConstants.ROOMS_LIST_RETRIEVAL_ERROR_KEY);
         logDebugMessage("Fetched devices list: " + aggregatedDevices);
+        return zoomRoomIds;
     }
 
     /**
      * Retrieve the rooms list and merge the subscribed rooms into {@link #aggregatedDevices}
      * @param retrievedRoomIds list of retrieved device ids to keep track of
+     * @return every room id Zoom listed, subscribed or not
      * @throws Exception if any error occurs
      * */
-    private void fetchRooms(List<String> retrievedRoomIds) throws Exception {
+    private Set<String> fetchRooms(List<String> retrievedRoomIds) throws Exception {
         List<AggregatedDevice> zoomRooms = listRooms();
         long listedAt = System.currentTimeMillis();
         Set<String> subscribed = subscription;
@@ -2428,6 +2440,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         });
 
         logDebugMessage("Updated ZoomRooms devices metadata: " + aggregatedDevices);
+        return zoomRooms.stream().map(AggregatedDevice::getDeviceId).collect(Collectors.toSet());
     }
 
     /**
@@ -2843,12 +2856,12 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param roomId Id of zoom room
      * @throws Exception if any error occurs
      */
-    private void populateDeviceDetails(String roomId) throws Exception {
+    private boolean populateDeviceDetails(String roomId) throws Exception {
         logDebugMessage("Fetching room details for device " + roomId);
         AggregatedDevice aggregatedZoomRoomDevice = aggregatedDevices.get(roomId);
         if (aggregatedZoomRoomDevice == null) {
             logDebugMessage("Unable to find cached room with id " + roomId);
-            return;
+            return false;
         }
         // To restore properties that were here before, but to override the rest
         Map<String, String> controlValues = new HashMap<>();
@@ -2858,7 +2871,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             properties = new HashMap<>(aggregatedZoomRoomDevice.getProperties());
         }
         try {
-            collectDeviceDetails(roomId, aggregatedZoomRoomDevice, properties, controlValues);
+            return collectDeviceDetails(roomId, aggregatedZoomRoomDevice, properties, controlValues);
         } finally {
             controlValuesDuringCollection.remove(roomId, controlValues);
         }
@@ -2872,9 +2885,10 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param aggregatedZoomRoomDevice cached room
      * @param properties               copy of the room's properties
      * @param controlValues            control values set during this collection, see {@link #controlValuesDuringCollection}
+     * @return {@code true} if no group of the room kept values from an earlier cycle
      * @throws Exception if any error occurs
      */
-    private void collectDeviceDetails(String roomId, AggregatedDevice aggregatedZoomRoomDevice, Map<String, String> properties,
+    private boolean collectDeviceDetails(String roomId, AggregatedDevice aggregatedZoomRoomDevice, Map<String, String> properties,
             Map<String, String> controlValues) throws Exception {
 
         Map<String, String> roomMetricsProperties = zoomRoomsMetricsData.get(roomId);
@@ -2907,9 +2921,12 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         // Each group is collected on its own: a group that fails keeps its last values (or none) and is reported,
         // the other groups of the room are still collected
         List<String> failedGroups = new ArrayList<>();
+        boolean fresh = true;
         if (properties.containsKey(PropertyNameConstants.METRICS_ROOM_STATUS) && properties.get(PropertyNameConstants.METRICS_ROOM_STATUS).equals("InMeeting")) {
-            if (collectRoomGroup(roomId, "LiveMeeting", failedGroups, () -> retrieveZoomRoomMetricsDetails(roomId, properties),
-                    () -> validLiveMeetingsDataRetrievalPeriodTimestamps.remove(roomId))) {
+            Group liveMeeting = collectRoomGroup(roomId, "LiveMeeting", failedGroups, () -> retrieveZoomRoomMetricsDetails(roomId, properties),
+                    () -> validLiveMeetingsDataRetrievalPeriodTimestamps.remove(roomId));
+            fresh &= liveMeeting != Group.STALE;
+            if (liveMeeting == Group.FETCHED) {
                 observed(times, properties, PropertyNameConstants.LIVE_MEETING_GROUP);
             }
             applyRoomInCall(aggregatedZoomRoomDevice, true);
@@ -2920,8 +2937,10 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
 
         if (!excludePropertyGroups.contains("RoomUserDetails")) {
             String roomUserId = aggregatedZoomRoomDevice.getSerialNumber();
-            if (collectRoomGroup(roomId, "RoomUserDetails", failedGroups, () -> populateRoomUserDetails(roomUserId, properties),
-                    () -> validUserDetailsDataRetrievalPeriodTimestamps.remove(roomUserId))) {
+            Group userDetails = collectRoomGroup(roomId, "RoomUserDetails", failedGroups, () -> populateRoomUserDetails(roomUserId, properties),
+                    () -> validUserDetailsDataRetrievalPeriodTimestamps.remove(roomUserId));
+            fresh &= userDetails != Group.STALE;
+            if (userDetails == Group.FETCHED) {
                 observed(times, properties, PropertyNameConstants.ROOM_USER_DETAILS_GROUP);
             }
         }
@@ -2929,16 +2948,21 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         boolean roomDevicesGroup = !excludePropertyGroups.contains("RoomDevices");
         // one request for the group and the room devices alike
         if (roomDevicesGroup || includeRoomDevices) {
-            if (collectRoomGroup(roomId, "RoomDevices", failedGroups,
+            Group roomDevices = collectRoomGroup(roomId, "RoomDevices", failedGroups,
                     () -> retrieveGroupedRoomDevicesInformation(roomId, properties, roomDevicesGroup),
-                    () -> validRoomDevicesDataRetrievalPeriodTimestamps.remove(roomId)) && roomDevicesGroup) {
+                    () -> validRoomDevicesDataRetrievalPeriodTimestamps.remove(roomId));
+            fresh &= roomDevices != Group.STALE;
+            if (roomDevices == Group.FETCHED && roomDevicesGroup) {
                 // the group also sets the room's online, see retrieveGroupedRoomDevicesInformation
                 times.put(ONLINE_KEY, observed(times, properties, PropertyNameConstants.ROOM_DEVICES_GROUP));
             }
         }
         if (!excludePropertyGroups.contains("RoomControlSettings")) {
-            if (collectRoomGroup(roomId, "RoomControlSettings", failedGroups, () -> populateRoomSettings(roomId, properties, controllableProperties),
-                    () -> validRoomSettingsDataRetrievalPeriodTimestamps.remove(roomId))) {
+            Group settings = collectRoomGroup(roomId, "RoomControlSettings", failedGroups,
+                    () -> populateRoomSettings(roomId, properties, controllableProperties),
+                    () -> validRoomSettingsDataRetrievalPeriodTimestamps.remove(roomId));
+            fresh &= settings != Group.STALE;
+            if (settings == Group.FETCHED) {
                 observed(times, properties, PropertyNameConstants.ROOM_CONTROLS_ALERT_SETTINGS_GROUP,
                         PropertyNameConstants.ROOM_CONTROLS_MEETING_SETTINGS_GROUP);
             }
@@ -2959,6 +2983,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             // Reported by the caller as this room's error (Errors#<roomId>), and cleared once every group succeeds
             throw new RuntimeException(String.join("; ", failedGroups));
         }
+        return fresh;
     }
 
     /**
@@ -2971,9 +2996,9 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param failedGroups  failures of this room's collection so far, appended to
      * @param collector     the group's collection
      * @param resetCooldown resets the group's cooldown for this room, may be null when the group has none
-     * @return {@code true} if Zoom answered with the group's values, {@code false} if it was skipped or failed
+     * @return how the group was collected; {@link Group#STALE} if it failed
      */
-    private boolean collectRoomGroup(String roomId, String group, List<String> failedGroups, RoomGroupCollector collector, Runnable resetCooldown) {
+    private Group collectRoomGroup(String roomId, String group, List<String> failedGroups, RoomGroupCollector collector, Runnable resetCooldown) {
         try {
             return collector.collect();
         } catch (Exception e) {
@@ -2982,7 +3007,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             if (resetCooldown != null) {
                 resetCooldown.run();
             }
-            return false;
+            return Group.STALE;
         }
     }
 
@@ -3063,7 +3088,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param roomUserId id of the room user to populate properties for
      * @param properties map to add statistics to
      */
-    private boolean populateRoomUserDetails(String roomUserId, Map<String, String> properties) throws Exception {
+    private Group populateRoomUserDetails(String roomUserId, Map<String, String> properties) throws Exception {
         long currentTimestamp = System.currentTimeMillis();
         Long dataRetrievalTimestamp = validUserDetailsDataRetrievalPeriodTimestamps.get(roomUserId);
         long roomUserDetailsProperties = properties.keySet().stream().filter(s -> s.startsWith(PropertyNameConstants.ROOM_USER_DETAILS_GROUP)).count();
@@ -3071,7 +3096,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                 dataRetrievalTimestamp > currentTimestamp) {
             logDebugMessage(String.format("Room User details retrieval is in cooldown. %s seconds left",
                     (dataRetrievalTimestamp - currentTimestamp) / 1000));
-            return false;
+            return Group.STALE;
         }
         validUserDetailsDataRetrievalPeriodTimestamps.put(roomUserId, currentTimestamp + roomUserDetailsRetrievalTimeout);
 
@@ -3086,7 +3111,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         }
 
         logDebugMessage("Updated ZoomRooms user details: " + roomUserProperties);
-        return true;
+        return Group.FETCHED;
     }
 
     /**
@@ -3097,10 +3122,10 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param properties             map to add statistics to
      * @param controllableProperties list of controllable properties, to add controls to
      */
-    private boolean populateRoomSettings(String roomId, Map<String, String> properties, List<AdvancedControllableProperty> controllableProperties) throws Exception {
+    private Group populateRoomSettings(String roomId, Map<String, String> properties, List<AdvancedControllableProperty> controllableProperties) throws Exception {
         if (!displayRoomSettings) {
             logDebugMessage("Room settings retrieval is switched off by displayRoomSettings property.");
-            return false;
+            return Group.SKIPPED;
         }
         Long dataRetrievalTimestamp = validRoomSettingsDataRetrievalPeriodTimestamps.get(roomId);
         long currentTimestamp = System.currentTimeMillis();
@@ -3109,7 +3134,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         if (roomSettingsProperties > 0 && dataRetrievalTimestamp != null && dataRetrievalTimestamp > currentTimestamp) {
             logDebugMessage(String.format("Room settings retrieval is in cooldown. %s seconds left",
                     (dataRetrievalTimestamp - currentTimestamp) / 1000));
-            return false;
+            return Group.STALE;
         }
         validRoomSettingsDataRetrievalPeriodTimestamps.put(roomId, currentTimestamp + roomSettingsRetrievalTimeout);
 
@@ -3165,7 +3190,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         properties.putAll(settingsProperties);
         controllableProperties.addAll(settingsControls);
         logDebugMessage("Updated ZoomRooms room settings: " + settingsProperties);
-        return true;
+        return Group.FETCHED;
     }
 
     /**
@@ -3177,17 +3202,17 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param roomId     to get devices for
      * @param properties to save properties to
      * @param grouped    whether the group's properties (and the room's online) are filled, i.e. the group is not excluded
-     * @return {@code true} if Zoom listed the room's devices (and the room's online was set from them)
+     * @return {@link Group#FETCHED} if Zoom listed the room's devices (and the room's online was set from them)
      * @throws Exception if any error occurs
      */
-    private boolean retrieveGroupedRoomDevicesInformation(String roomId, Map<String, String> properties, boolean grouped) throws Exception {
+    private Group retrieveGroupedRoomDevicesInformation(String roomId, Map<String, String> properties, boolean grouped) throws Exception {
         Long dataRetrievalTimestamp = validRoomDevicesDataRetrievalPeriodTimestamps.get(roomId);
         long currentTimestamp = System.currentTimeMillis();
         long roomDevicesProperties = properties.keySet().stream().filter(s -> s.startsWith(PropertyNameConstants.ROOM_DEVICES_GROUP)).count();
         if ((roomDevicesProperties > 0 || !grouped) && dataRetrievalTimestamp != null && dataRetrievalTimestamp > currentTimestamp) {
             logDebugMessage(String.format("Room devices retrieval is in cooldown. %s seconds left",
                     (dataRetrievalTimestamp - currentTimestamp) / 1000));
-            return false;
+            return Group.STALE;
         }
         validRoomDevicesDataRetrievalPeriodTimestamps.put(roomId, currentTimestamp + roomDevicesRetrievalTimeout);
 
@@ -3253,7 +3278,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             });
         }
         logDebugMessage("Updated ZoomRooms devices properties: " + devices);
-        return devices != null && devices.isArray();
+        return devices != null && devices.isArray() ? Group.FETCHED : Group.SKIPPED;
     }
 
     /**
@@ -3319,24 +3344,26 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * To have better control over data collection - it is bound to {@link ZoomRoomsAggregatorCommunicator#validMetricsDataRetrievalPeriodTimestamp} variable
      * in order to only fetch this information when {@link ZoomRoomsAggregatorCommunicator#metricsRetrievalTimeout} has exceeded
      *
+     * @return {@code true} if the rooms carry no metrics older than this call: fetched now, or switched off
      * @throws Exception if any error occurs
      */
-    private void retrieveZoomRoomMetrics() throws Exception {
+    private boolean retrieveZoomRoomMetrics() throws Exception {
         long currentTimestamp = System.currentTimeMillis();
+        if (!includeRoomsMetrics) {
+            logDebugMessage("includeRoomsMetrics is set to false, skipping metrics retrieval.");
+            return true;
+        }
         if (zoomRoomsMetricsData.size() > 0 && validMetricsDataRetrievalPeriodTimestamp > currentTimestamp) {
             logDebugMessage(String.format("Metrics retrieval is in cooldown. %s seconds left",
                     (validMetricsDataRetrievalPeriodTimestamp - currentTimestamp) / 1000));
-            return;
-        }
-        if (!includeRoomsMetrics) {
-            logDebugMessage("includeRoomsMetrics is set to false, skipping metrics retrieval.");
-            return;
+            return false;
         }
         if (metricsBlockedUntil > currentTimestamp) {
             logDebugMessage(String.format("Metrics API rate limit reached, metrics retrieval is skipped until %s", Instant.ofEpochMilli(metricsBlockedUntil)));
-            return;
+            return false;
         }
         validMetricsDataRetrievalPeriodTimestamp = currentTimestamp + metricsRetrievalTimeout;
+        boolean fetched = true;
         try {
             fetchMetricsPages((roomId, metrics, at) -> {
                 zoomRoomsMetricsData.put(roomId, metrics);
@@ -3346,12 +3373,14 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
         } catch (CommandFailureException ex) {
             if (ex.getStatusCode() == 429) {
                 logger.warn(String.format("Rate limit for %s API was reached, cached metrics are kept.", ZOOM_ROOMS_METRICS_URL), ex);
+                fetched = false;
             } else {
                 throw ex;
             }
         }
         knownErrors.remove(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY);
         unreachableErrors.remove(PropertyNameConstants.ROOMS_METRICS_RETRIEVAL_ERROR_KEY);
+        return fetched;
     }
 
     /**
@@ -3397,13 +3426,18 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
      * @param properties map to save data to
      * @throws Exception if a communication error occurs
      */
-    private boolean retrieveZoomRoomMetricsDetails(String roomId, Map<String, String> properties) throws Exception {
+    private Group retrieveZoomRoomMetricsDetails(String roomId, Map<String, String> properties) throws Exception {
+        if (!displayLiveMeetingDetails) {
+            logDebugMessage(String.format("Skipping collection of meeting details for room %s. showLiveMeetingDetails parameter is set to false", roomId));
+            cleanupStaleProperties(properties, PropertyNameConstants.LIVE_MEETING_GROUP);
+            return Group.SKIPPED;
+        }
         long currentTimestamp = System.currentTimeMillis();
         Long dataRetrievalTimestamp = validLiveMeetingsDataRetrievalPeriodTimestamps.get(roomId);
         if (dataRetrievalTimestamp != null && dataRetrievalTimestamp > currentTimestamp) {
             logDebugMessage(String.format("Meeting metrics retrieval is in cooldown. %s seconds left",
                     (dataRetrievalTimestamp - currentTimestamp) / 1000));
-            return false;
+            return Group.STALE;
         }
         // Metrics retrieval timeout is used so this information is retrieve once per general metrics refresh period.
         // First full metrics payload is retrieved, then the details (if necessary), an only once. Next iteration
@@ -3418,11 +3452,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             logDebugMessage(String.format("Skipping collection of meeting details for room %s. Remaining metrics rate limit: %s", roomId, metricsRateLimitRemaining));
             properties.put(PropertyNameConstants.LIVE_MEETING_GROUP_WARNING,
                     String.format("Daily request rate threshold of %s for the Meeting Dashboard API was reached.", liveMeetingDetailsDailyRequestRateThreshold));
-            return false;
-        }
-        if (!displayLiveMeetingDetails) {
-            logDebugMessage(String.format("Skipping collection of meeting details for room %s. showLiveMeetingDetails parameter is set to false", roomId));
-            return false;
+            return Group.SKIPPED;
         }
 
         try {
@@ -3430,7 +3460,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
             if (roomsMetrics != null && !roomsMetrics.isNull() && roomsMetrics.has("live_meeting")) {
                 aggregatedDeviceProcessor.applyProperties(properties, roomsMetrics, "ZoomRoomMeeting");
                 properties.put(PropertyNameConstants.LIVE_MEETING_DATA_RETRIEVED_TIME, dateFormat.format(new Date()));
-                return true;
+                return Group.FETCHED;
             }
             logDebugMessage("Retrieve ZoomRooms deeting details for room: " + roomId);
         } catch (CommandFailureException ex) {
@@ -3440,7 +3470,7 @@ public class ZoomRoomsAggregatorCommunicator extends RestCommunicator
                 throw ex;
             }
         }
-        return false;
+        return Group.SKIPPED;
     }
 
     /**

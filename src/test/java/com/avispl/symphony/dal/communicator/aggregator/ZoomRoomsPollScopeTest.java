@@ -84,14 +84,16 @@ public class ZoomRoomsPollScopeTest {
     @Test
     public void poll_shouldDropRoom_whenSubscriptionShrinksDuringRoomsListCooldown() throws Exception {
         zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
+        expireCooldownsButTheRoomsList();
 
         PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
 
         Assertions.assertEquals(Collections.singletonList(room1), ids(result));
+        Assertions.assertEquals(Collections.singleton(room1), this.<Map<String, ?>>field("aggregatedDevices").keySet());
     }
 
     @Test
-    public void poll_shouldCollectDetailsOnlyForEventRoomsItKeeps_whenEvent() throws Exception {
+    public void poll_shouldCollectAndReportOnlyEventRoomsItKeeps_whenEvent() throws Exception {
         zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
         expireCooldowns();
         zoom.clearRequests();
@@ -99,7 +101,86 @@ public class ZoomRoomsPollScopeTest {
         PollResult result = zoom.poll(context(PollContext.Reason.EVENT, room2, room3));
 
         Assertions.assertEquals(Arrays.asList("rooms", "metrics", "users/" + user(room2), "rooms/" + room2 + "/devices"), zoom.requests());
-        Assertions.assertEquals(new HashSet<>(Arrays.asList(room1, room2)), new HashSet<>(ids(result)), "an event poll keeps the subscription");
+        Assertions.assertEquals(Collections.singletonList(room2), ids(result), "room1 was not polled, room3 is not subscribed");
+        Assertions.assertEquals(set(room1, room2), this.<Map<String, ?>>field("aggregatedDevices").keySet(), "an event poll keeps the subscription");
+    }
+
+    @Test
+    public void poll_shouldReportNothing_whenEveryGroupIsInCooldown() throws Exception {
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
+
+        PollResult second = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
+
+        Assertions.assertEquals(Collections.emptyList(), zoom.requests().subList(4, zoom.requests().size()), "everything in cooldown");
+        Assertions.assertEquals(Collections.emptyList(), ids(second));
+        Assertions.assertTrue(second.getObservedAt().isEmpty(), "times of reported devices only: " + second.getObservedAt());
+        Assertions.assertNull(second.getListed(), "the rooms list was not requested");
+    }
+
+    @Test
+    public void poll_shouldLeaveOutTheRoom_whenOneOfItsGroupsIsInCooldown() throws Exception {
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
+        expireCooldowns();
+        this.<Map<String, Long>>field("validUserDetailsDataRetrievalPeriodTimestamps").put(user(room1), Long.MAX_VALUE);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
+
+        Assertions.assertEquals(Collections.singletonList(room2), ids(result));
+        Assertions.assertEquals(set(room1, room2, room3), result.getListed());
+    }
+
+    @Test
+    public void poll_shouldReportTheRoomInAMeeting_whenLiveMeetingDetailsAreOffAndTheirCooldownRuns() throws Exception {
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room2));
+        expireCooldowns();
+        this.<Map<String, Long>>field("validLiveMeetingsDataRetrievalPeriodTimestamps").put(room2, Long.MAX_VALUE);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room2));
+
+        Assertions.assertEquals(Collections.singletonList(room2), ids(result));
+    }
+
+    @Test
+    public void poll_shouldLeaveOutTheRoom_whenOneOfItsGroupsFails() throws Exception {
+        zoom.failing.add("users/" + user(room1));
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
+
+        Assertions.assertEquals(Collections.singletonList(room2), ids(result));
+        Assertions.assertTrue(result.getErrors().containsKey(room1), "the room's error: " + result.getErrors());
+        Assertions.assertEquals(set(room1, room2, room3), result.getListed());
+    }
+
+    @Test
+    public void poll_shouldReportNothing_whenTheMetricsAreInCooldown() throws Exception {
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
+        expireCooldowns();
+        setField("validMetricsDataRetrievalPeriodTimestamp", Long.MAX_VALUE);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
+
+        Assertions.assertEquals(Collections.emptyList(), ids(result));
+        Assertions.assertEquals(set(room1, room2, room3), result.getListed());
+    }
+
+    @Test
+    public void poll_shouldReportNothingButTheList_whenTheDeadlineHasPassed() throws Exception {
+        PollResult result = zoom.poll(new PollContext(executor, Instant.now().minusSeconds(1), PollContext.Reason.SCHEDULE, set(room1)));
+
+        Assertions.assertFalse(result.isComplete());
+        Assertions.assertEquals(Collections.emptyList(), ids(result));
+        Assertions.assertEquals(set(room1, room2, room3), result.getListed());
+    }
+
+    @Test
+    public void poll_shouldLeaveOutRoomDevices_whenTheirRoomIsLeftOut() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+        zoom.failing.add("users/" + user(room1));
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1, device(room1), room2, device(room2)));
+
+        Assertions.assertEquals(set(room2, device(room2)), new HashSet<>(ids(result)));
+        Assertions.assertEquals(set(room1, room2, room3, device(room1), device(room2)), result.getListed());
     }
 
     @Test
@@ -121,7 +202,7 @@ public class ZoomRoomsPollScopeTest {
         Assertions.assertEquals(Boolean.TRUE, inCall(inMeeting));
         Assertions.assertEquals(Boolean.FALSE, inCall(byId(inventory, room1)));
         Assertions.assertEquals(Boolean.FALSE, byId(inventory, room3).getDeviceOnline());
-        Assertions.assertEquals(Collections.singletonList(room1), ids(zoom.poll(context(PollContext.Reason.WEBHOOK, room1))));
+        Assertions.assertEquals(Collections.singleton(room1), this.<Map<String, ?>>field("aggregatedDevices").keySet());
         Assertions.assertEquals(listCooldown, (long) field("validDeviceMetaDataRetrievalPeriodTimestamp"));
         Assertions.assertEquals(metricsCooldown, (long) field("validMetricsDataRetrievalPeriodTimestamp"));
     }
@@ -144,42 +225,19 @@ public class ZoomRoomsPollScopeTest {
     }
 
     @Test
-    public void poll_shouldKeepTimesAndTimestamp_whenEveryGroupIsInCooldown() throws Exception {
+    public void poll_shouldRenewEveryTimeOfTheRoom_whenPolledAgain() throws Exception {
         PollResult first = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
         TimeUnit.MILLISECONDS.sleep(20);
-
-        PollResult second = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
-
-        Assertions.assertEquals(Collections.emptyList(), zoom.requests().subList(4, zoom.requests().size()), "everything in cooldown");
-        Assertions.assertEquals(first.getObservedAt().get(room1), second.getObservedAt().get(room1));
-        Assertions.assertEquals(byId(first, room1).getTimestamp(), byId(second, room1).getTimestamp());
-    }
-
-    @Test
-    public void poll_shouldRenewOnlyTheFetchedGroupsTimes_whenOneGroupLeavesCooldown() throws Exception {
-        PollResult first = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
-        TimeUnit.MILLISECONDS.sleep(20);
-        this.<Map<?, ?>>field("validUserDetailsDataRetrievalPeriodTimestamps").clear();
+        expireCooldowns();
 
         PollResult second = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
 
         Map<String, Long> before = first.getObservedAt().get(room1);
         Map<String, Long> after = second.getObservedAt().get(room1);
-        Assertions.assertTrue(after.get("RoomUserDetails#RoleName") > before.get("RoomUserDetails#RoleName"));
-        Assertions.assertEquals(before.get("Metrics#DeviceIp"), after.get("Metrics#DeviceIp"));
-        Assertions.assertEquals(before.get("online"), after.get("online"));
-        Assertions.assertEquals(after.get("RoomUserDetails#RoleName"), byId(second, room1).getTimestamp());
+        for (String key : Arrays.asList("online", "inCall", "Metrics#DeviceIp", "RoomUserDetails#RoleName")) {
+            Assertions.assertTrue(after.get(key) > before.get(key), key);
+        }
         Assertions.assertTrue(byId(second, room1).getTimestamp() > byId(first, room1).getTimestamp());
-    }
-
-    @Test
-    public void poll_shouldReportTimesOfRoomsOnly_whenWebhookSnapshot() throws Exception {
-        zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
-
-        PollResult snapshot = zoom.poll(context(PollContext.Reason.WEBHOOK, room1));
-
-        Assertions.assertEquals(Collections.singleton(room1), snapshot.getObservedAt().keySet());
-        Assertions.assertEquals(Collections.max(snapshot.getObservedAt().get(room1).values()), byId(snapshot, room1).getTimestamp());
     }
 
     @Test
@@ -229,6 +287,7 @@ public class ZoomRoomsPollScopeTest {
     public void poll_shouldDropRoomDevice_whenItsRoomLeavesTheSubscription() throws Exception {
         zoom.setIncludeRoomDevices(true);
         zoom.poll(context(PollContext.Reason.SCHEDULE, room1, device(room1)));
+        expireCooldownsButTheRoomsList();
 
         PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room2, device(room1)));
 
@@ -298,9 +357,15 @@ public class ZoomRoomsPollScopeTest {
 
     private void expireCooldowns() throws Exception {
         setField("validDeviceMetaDataRetrievalPeriodTimestamp", 0L);
+        expireCooldownsButTheRoomsList();
+    }
+
+    private void expireCooldownsButTheRoomsList() throws Exception {
         setField("validMetricsDataRetrievalPeriodTimestamp", 0L);
         this.<Map<?, ?>>field("validUserDetailsDataRetrievalPeriodTimestamps").clear();
         this.<Map<?, ?>>field("validRoomDevicesDataRetrievalPeriodTimestamps").clear();
+        this.<Map<?, ?>>field("validLiveMeetingsDataRetrievalPeriodTimestamps").clear();
+        this.<Map<?, ?>>field("validRoomSettingsDataRetrievalPeriodTimestamps").clear();
     }
 
     @SuppressWarnings("unchecked")
@@ -319,6 +384,8 @@ public class ZoomRoomsPollScopeTest {
     /** Three rooms: room1 available, room2 in a meeting, room3 offline; logs every GET by its path without the query. */
     private class FakeZoom extends ZoomRoomsAggregatorCommunicator {
         private final List<String> requests = Collections.synchronizedList(new ArrayList<>());
+        /** Paths that answer with an error. */
+        final Set<String> failing = Collections.synchronizedSet(new HashSet<>());
 
         FakeZoom() throws IOException {
             setLogin("clientId");
@@ -358,6 +425,9 @@ public class ZoomRoomsPollScopeTest {
                         + metrics(room3, "Offline") + "],\"next_page_token\":\"\"}"));
             }
             requests.add(path);
+            if (failing.contains(path)) {
+                throw new IllegalStateException("Zoom failed on " + path);
+            }
             if (path.startsWith("users/")) {
                 return responseClass.cast(JSON.readTree("{\"role_name\":\"Member\",\"email\":\"" + path + "@example.com\"}"));
             }

@@ -140,11 +140,9 @@ public class ZoomRoomsHostPolledTest {
         int requests = zoom.requests.get();
 
         zoom.digest(Collections.singletonList(meetingStarted(roomUserId)));
-        PollResult afterWebhook = zoom.poll(context(PollContext.Reason.WEBHOOK, 30));
 
-        Assertions.assertEquals(Boolean.TRUE, inCall(afterWebhook.getDevices().get(0)));
         Assertions.assertEquals(Boolean.FALSE, inCall(scheduled.getDevices().get(0)), "an earlier result is never changed");
-        Assertions.assertEquals(requests, zoom.requests.get(), "a webhook cycle makes no vendor requests");
+        Assertions.assertEquals(requests, zoom.requests.get(), "digest makes no vendor requests");
     }
 
     @Test
@@ -181,7 +179,9 @@ public class ZoomRoomsHostPolledTest {
 
         Assertions.assertFalse(result.isComplete());
         Assertions.assertTrue(System.currentTimeMillis() - started < 3000, "the cycle ends near its deadline, not after the slow room");
-        Assertions.assertEquals(2, result.getDevices().size());
+        Assertions.assertEquals(1, result.getDevices().size(), "the slow room the deadline cut is left out");
+        Assertions.assertEquals(roomId, result.getDevices().get(0).getDeviceId());
+        Assertions.assertEquals(2, result.getListed().size(), "both rooms are listed");
     }
 
     @Test
@@ -205,37 +205,6 @@ public class ZoomRoomsHostPolledTest {
 
         Assertions.assertFalse(result.isComplete());
         Assertions.assertTrue(System.currentTimeMillis() - started < 3000, "rooms not started by the deadline are skipped, not queued behind the slow ones");
-    }
-
-    @Test
-    public void poll_shouldNotWaitForAVendorCycle_whenAskedForAWebhookSnapshot() throws Exception {
-        zoom.holdRooms = new CountDownLatch(1);
-        Thread scheduled = new Thread(() -> {
-            try {
-                zoom.poll(context(PollContext.Reason.SCHEDULE, 30));
-            } catch (Exception e) {
-                throw new IllegalStateException(e);
-            }
-        });
-        scheduled.start();
-        Assertions.assertTrue(zoom.roomsRequested.await(5, TimeUnit.SECONDS));
-        AtomicReference<PollResult> snapshot = new AtomicReference<>();
-        Thread webhook = new Thread(() -> {
-            try {
-                snapshot.set(zoom.poll(context(PollContext.Reason.WEBHOOK, 30)));
-            } catch (Exception e) {
-                throw new IllegalStateException(e);
-            }
-        });
-
-        webhook.start();
-        webhook.join(2000);
-
-        Assertions.assertNotNull(snapshot.get(), "the webhook snapshot does not wait for the vendor cycle");
-        Assertions.assertTrue(snapshot.get().getAggregatorStatistics().isEmpty());
-        zoom.holdRooms.countDown();
-        scheduled.join(5000);
-        Assertions.assertEquals(1, zoom.roomsRequests.get());
     }
 
     @Test
