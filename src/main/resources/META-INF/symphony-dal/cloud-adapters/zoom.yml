@@ -1,6 +1,8 @@
 # How the Symphony cloud adapter service hosts this adapter (ignored by CommProxy). File name = adapter type key.
 class-name: com.avispl.symphony.dal.communicator.aggregator.ZoomRoomsAggregatorCommunicator
 display-name: Zoom Rooms
+# parallel requests of one connection at most; the host grows to it when cycles miss their deadline. ~15-20 req/s, under the Light/Medium limits
+max-parallel-requests: 10
 # no room-property: each aggregated device is a Zoom Room, its name is the device name
 webhook-watch: [inCall]   # Zoom webhooks report meetings (inCall), not online
 setup-steps:
