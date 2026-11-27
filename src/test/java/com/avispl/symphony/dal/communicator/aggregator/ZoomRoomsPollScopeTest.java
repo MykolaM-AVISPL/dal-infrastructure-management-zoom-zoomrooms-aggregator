@@ -182,7 +182,95 @@ public class ZoomRoomsPollScopeTest {
         Assertions.assertEquals(Collections.max(snapshot.getObservedAt().get(room1).values()), byId(snapshot, room1).getTimestamp());
     }
 
+    @Test
+    public void poll_shouldCollectTheRoomWithTheOldestDetailsFirst() throws Exception {
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room1, room2));
+
+        for (String oldest : Arrays.asList(room1, room2)) {
+            expireCooldowns();
+            Map<String, Long> collectedAt = field("detailsCollectedAt");
+            collectedAt.put(room1, oldest.equals(room1) ? 1L : 2L);
+            collectedAt.put(room2, oldest.equals(room2) ? 1L : 2L);
+            zoom.clearRequests();
+
+            // one room at a time, in the order the adapter hands them over
+            zoom.poll(new PollContext(Runnable::run, Instant.now().plusSeconds(30), PollContext.Reason.SCHEDULE, set(room1, room2)));
+
+            Assertions.assertEquals("users/" + user(oldest), zoom.requests().get(2), "the first room request of " + zoom.requests());
+        }
+    }
+
+    @Test
+    public void poll_shouldReportSubscribedRoomDevices_withOneDevicesRequestPerRoom_whenIncludeRoomDevices() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1, device(room1)));
+
+        Assertions.assertEquals(Arrays.asList("rooms", "metrics", "users/" + user(room1), "rooms/" + room1 + "/devices"), zoom.requests());
+        Assertions.assertEquals(set(room1, device(room1)), new HashSet<>(ids(result)));
+        AggregatedDevice roomDevice = byId(result, device(room1));
+        Assertions.assertEquals(Boolean.TRUE, roomDevice.getDeviceOnline());
+        Map<String, Long> times = result.getObservedAt().get(device(room1));
+        Assertions.assertNotNull(times, "observedAt of " + device(room1) + ": " + result.getObservedAt());
+        Assertions.assertTrue(times.containsKey("online"), "online timed: " + times);
+        Assertions.assertEquals(Collections.max(times.values()), roomDevice.getTimestamp());
+    }
+
+    @Test
+    public void poll_shouldLeaveOutRoomDevicesNotSubscribed_whenIncludeRoomDevices() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room1));
+
+        Assertions.assertEquals(Collections.singletonList(room1), ids(result));
+    }
+
+    @Test
+    public void poll_shouldDropRoomDevice_whenItsRoomLeavesTheSubscription() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+        zoom.poll(context(PollContext.Reason.SCHEDULE, room1, device(room1)));
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room2, device(room1)));
+
+        Assertions.assertEquals(Collections.singletonList(room2), ids(result));
+        Assertions.assertFalse(result.getObservedAt().containsKey(device(room1)));
+    }
+
+    @Test
+    public void poll_shouldTimeRoomDevicesInCallByTheirRoom_whenRoomDevicesFollowTheCall() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+        zoom.setIncludeRoomDevicesInCalls(true);
+
+        PollResult result = zoom.poll(context(PollContext.Reason.SCHEDULE, room2, device(room2)));
+
+        AggregatedDevice roomDevice = byId(result, device(room2));
+        Assertions.assertEquals(Boolean.TRUE, inCall(roomDevice));
+        Assertions.assertEquals(result.getObservedAt().get(room2).get("inCall"), result.getObservedAt().get(device(room2)).get("inCall"));
+        Assertions.assertEquals(Collections.max(result.getObservedAt().get(device(room2)).values()), roomDevice.getTimestamp());
+    }
+
+    @Test
+    public void handshake_shouldListTheDevicesOfTheGivenRoomsOnly_whenIncludeRoomDevices() throws Exception {
+        zoom.setIncludeRoomDevices(true);
+
+        PollResult inventory = zoom.handshake(context(PollContext.Reason.MANUAL, room1));
+
+        Assertions.assertEquals(Arrays.asList("rooms", "metrics", "rooms/" + room1 + "/devices"), zoom.requests());
+        Assertions.assertEquals(set(room1, room2, room3, device(room1)), new HashSet<>(ids(inventory)));
+        Map<String, Long> times = inventory.getObservedAt().get(device(room1));
+        Assertions.assertEquals(Collections.max(times.values()), byId(inventory, device(room1)).getTimestamp());
+    }
+
     // ---- helpers
+
+    private static Set<String> set(String... ids) {
+        return new HashSet<>(Arrays.asList(ids));
+    }
+
+    /** The one device the fake lists in a room. */
+    private static String device(String roomId) {
+        return "d-" + roomId;
+    }
 
     private PollContext context(PollContext.Reason reason, String... devices) {
         Set<String> subscription = devices == null ? null : new HashSet<>(Arrays.asList(devices));

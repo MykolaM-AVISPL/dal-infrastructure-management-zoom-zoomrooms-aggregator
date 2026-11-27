@@ -58,6 +58,7 @@ settings:
     label: Room devices (controllers, scheduling displays)
     type: bool
     default: "false"
+    hint: "Devices of the rooms that are in Symphony: add the room first, then Discover devices offers its devices."
   includeRoomDevicesInCalls:
     label: Room devices follow the room's in-call status
     type: bool

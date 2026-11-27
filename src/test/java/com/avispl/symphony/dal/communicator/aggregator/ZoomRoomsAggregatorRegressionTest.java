@@ -76,14 +76,17 @@ public class ZoomRoomsAggregatorRegressionTest {
     @Test
     public void roomDevicesAreReadFromEveryPage() throws Exception {
         ZoomRoomsAggregatorCommunicator communicator = new PaginatedDevicesCommunicator();
+        communicator.setIncludeRoomDevices(true);
         communicator.init();
         try {
-            Method method = ZoomRoomsAggregatorCommunicator.class.getDeclaredMethod("updateAndRetrieveRoomDevices", String.class);
+            aggregatedDevices(communicator).put(ROOM_ID, new AggregatedDevice());
+            Method method = ZoomRoomsAggregatorCommunicator.class.getDeclaredMethod("retrieveGroupedRoomDevicesInformation", String.class, Map.class,
+                    boolean.class);
             method.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            List<String> deviceIds = (List<String>) method.invoke(communicator, ROOM_ID);
+            method.invoke(communicator, ROOM_ID, new HashMap<String, String>(), false);
 
-            Assertions.assertEquals(FIRST_PAGE_DEVICES + SECOND_PAGE_DEVICES, deviceIds.size());
+            long roomDevices = aggregatedDevices(communicator).keySet().stream().filter(key -> key.startsWith("room_device:")).count();
+            Assertions.assertEquals(FIRST_PAGE_DEVICES + SECOND_PAGE_DEVICES, roomDevices);
         } finally {
             communicator.destroy();
         }
@@ -99,9 +102,10 @@ public class ZoomRoomsAggregatorRegressionTest {
         try {
             aggregatedDevices(communicator).put(ROOM_ID, new AggregatedDevice());
             Map<String, String> properties = new HashMap<>();
-            Method method = ZoomRoomsAggregatorCommunicator.class.getDeclaredMethod("retrieveGroupedRoomDevicesInformation", String.class, Map.class);
+            Method method = ZoomRoomsAggregatorCommunicator.class.getDeclaredMethod("retrieveGroupedRoomDevicesInformation", String.class, Map.class,
+                    boolean.class);
             method.setAccessible(true);
-            method.invoke(communicator, ROOM_ID, properties);
+            method.invoke(communicator, ROOM_ID, properties, true);
 
             int onlineTotal = properties.entrySet().stream()
                     .filter(entry -> entry.getKey().endsWith("#OnlineDevicesTotal"))
